@@ -1,882 +1,1418 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-import os
-import sys
-import json
-import re
-import time
-import logging
-import hashlib
-import hmac
-import random
-import string
-import requests
-from datetime import datetime
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-from telegram.error import NetworkError, TimedOut
-from dotenv import load_dotenv
-
-# Carregar variáveis de ambiente
-load_dotenv()
-
-# Configurar logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Estados da conversa
-(EMAIL, PASSWORD, ACCOUNT_TYPE, VALOR_ENTRADA, MULTIPLICADOR_GALE, 
- MAX_GALES, STOP_LOSS, STOP_WIN, CONFIANCE, SCORE) = range(10)
-
-# Configurações
-CONFIG_DIR = "data/configs"
-os.makedirs(CONFIG_DIR, exist_ok=True)
-
-HISTORICO_MAX = 50
-
-class PainelOperacoes:
-    def __init__(self):
-        self.operacoes = []
-        self.stats = {
-            "total": 0, "wins": 0, "losses": 0, "gales": 0,
-            "lucro": 0.0, "sequencia": 0, "melhor_seq": 0, "pior_seq": 0
-        }
-    
-    def adicionar(self, operacao):
-        self.operacoes.insert(0, operacao)
-        if len(self.operacoes) > HISTORICO_MAX:
-            self.operacoes.pop()
-        self.atualizar_stats(operacao)
-    
-    def atualizar_stats(self, op):
-        self.stats["total"] += 1
-        if op["status"] == "WIN":
-            self.stats["wins"] += 1
-            self.stats["lucro"] += op["lucro"]
-            self.stats["sequencia"] = self.stats["sequencia"] + 1 if self.stats["sequencia"] >= 0 else 1
-        elif op["status"] == "LOSS":
-            self.stats["losses"] += 1
-            self.stats["lucro"] -= op["valor"]
-            self.stats["sequencia"] = self.stats["sequencia"] - 1 if self.stats["sequencia"] <= 0 else -1
-        elif op["status"] == "GALE":
-            self.stats["gales"] += 1
-        
-        self.stats["melhor_seq"] = max(self.stats["melhor_seq"], self.stats["sequencia"])
-        self.stats["pior_seq"] = min(self.stats["pior_seq"], self.stats["sequencia"])
-    
-    def get_status(self):
-        s = self.stats
-        taxa = (s["wins"] / s["total"] * 100) if s["total"] > 0 else 0
-        
-        status = f"""
-📊 ESTATÍSTICAS
-━━━━━━━━━━━━━━━━━━
-📈 Total: {s['total']}
-✅ Wins: {s['wins']}
-❌ Loss: {s['losses']}
-🔄 Gales: {s['gales']}
-📊 Taxa: {taxa:.1f}%
-💰 Lucro: R$ {s['lucro']:.2f}
-📈 Sequência: {self.formatar_seq(s['sequencia'])}
-🏆 Melhor: {s['melhor_seq']} | ❄️ Pior: {s['pior_seq']}
-━━━━━━━━━━━━━━━━━━
-📋 ÚLTIMAS 5 OPERAÇÕES
 """
-        for op in self.operacoes[:5]:
-            status += f"\n• {op['hora']} {op['ativo']} "
-            if op["status"] == "WIN":
-                status += f"✅ +R$ {op['lucro']:.2f}"
-            elif op["status"] == "LOSS":
-                status += f"❌ -R$ {op['valor']:.2f}"
-            elif op["status"] == "GALE":
-                status += f"🔄 Gale {op.get('gale', 0)}"
+╔═══════════════════════════════════════════════════════════════╗
+║           🤖 QUANTUM BOT v4.0 - IQ OPTION AUTOMÁTICO        ║
+║                                                               ║
+║  ✅ Usando a nova API Sudip-T/iqoption-api                    ║
+║  ✅ WebSocket para dados em tempo real                       ║
+║  ✅ Comunicação detalhada no PV do Telegram                   ║
+║  ✅ Status em tempo real de cada operação                     ║
+║  ✅ Apuração completa (WIN/LOSS/GALES)                       ║
+╚═══════════════════════════════════════════════════════════════╝
+"""
+
+import asyncio
+import json
+import logging
+import re
+import sys
+import os
+import traceback
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Dict, Any, Tuple
+
+from telethon import TelegramClient, events, Button
+
+# ==================== LOG ====================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('quantum_bot.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("QuantumBot")
+
+# ==================== CONSTANTES ====================
+
+CONFIG_FILE = "quantum_config.json"
+STATS_FILE  = "quantum_stats.json"
+
+# ==================== INTERFACE ====================
+
+class UI:
+
+    @staticmethod
+    def menu():
+        return """
+╔═══════════════════════════════════════════╗
+║                                           ║
+║           🤖 QUANTUM BOT v4.0            ║
+║        IQ OPTION AUTOMÁTICO              ║
+║                                           ║
+╚═══════════════════════════════════════════╝
+
+**MENU PRINCIPAL**
+
+Escolha uma opção abaixo:
+        """
+
+    @staticmethod
+    def configuracao_resumo(d: dict) -> str:
+        sinc = "✅ Sim" if d.get('sincronizar_vela', True) else "❌ Não"
+        return f"""
+═══════ CONFIGURAÇÕES ═══════
+
+📧 **Conta:** `{d.get('email','—')}`
+💵 **Entrada:** R$ {d.get('valor_entrada', 0):,.2f}
+🎯 **Gales:** {d.get('gales', 0)}
+✖️ **Multiplicador:** {d.get('multiplicador', 2.0)}x
+⏱️ **Antecipação:** {d.get('antecipacao', 5)}s
+🕯️ **Sinc. vela:** {sinc}
+🟢 **Stop Win:** R$ {d.get('stop_win', 0):,.2f}
+🔴 **Stop Loss:** R$ {d.get('stop_loss', 0):,.2f}
+🏦 **Conta:** {d.get('tipo_conta', '—').upper()}
+📡 **Canal:** `{d.get('canal_id', '—')}`
+
+═══════════════════════════
+        """
+
+    @staticmethod
+    def status_sistema(conectado: bool, saldo: float, tipo: str, s: dict) -> str:
+        ico = "🟢 CONECTADO" if conectado else "🔴 DESCONECTADO"
+        ct  = "💰 REAL" if tipo == "real" else "🎯 TREINAMENTO"
+        dt  = s.get('daily_trades', 0)
+        dw  = s.get('daily_wins', 0)
+        wr  = f"{dw/dt*100:.1f}%" if dt else "—"
+        return f"""
+📡 **STATUS DO SISTEMA**
+━━━━━━━━━━━━━━━━━━━━━━━
+
+🤖 **Bot:** {ico}
+🔗 **IQ Option:** {ico}
+💰 **Saldo:** R$ {saldo:,.2f}
+🏦 **Conta:** {ct}
+
+📊 **ESTATÍSTICAS DIÁRIAS**
+━━━━━━━━━━━━━━━━━━━━━━━
+📈 **Trades:** {dt}
+🟢 **Wins:** {dw}
+🔴 **Losses:** {s.get('daily_losses', 0)}
+🎯 **Winrate:** {wr}
+💵 **P&L:** R$ {s.get('daily_profit', 0):,.2f}
+
+🏆 **TOTAL GERAL**
+━━━━━━━━━━━━━━━━━━━━━━━
+📈 **Trades:** {s.get('total_trades', 0)}
+🟢 **Wins:** {s.get('total_wins', 0)}
+🔴 **Losses:** {s.get('total_losses', 0)}
+💵 **P&L:** R$ {s.get('total_profit', 0):,.2f}
+        """
+
+    @staticmethod
+    def sinal_recebido(s: dict, antec: int = 0, sinc: bool = False) -> str:
+        emoji = "🟢" if s.get('direcao', '').upper() == 'CALL' else "🔴"
+        nota = ""
+        if sinc:
+            nota += "\n🕯️ Aguardando início da vela..."
+        if antec:
+            nota += f"\n⏱️ Entrada {antec}s antes"
+        return f"""
+═══════ 📡 NOVO SINAL ═══════
+
+📈 **Ativo:** `{s.get('ativo', '—')}`
+{emoji} **Direção:** {s.get('direcao', '—').upper()}
+⏰ **Horário:** {s.get('horario', 'Imediato')}
+⌛ **Expiração:** {s.get('tempo', 1)}min
+{nota}
+
+════════════════════════
+        """
+
+    @staticmethod
+    def operacao_executando(valor: float, ativo: str, direcao: str, tempo: int, tentativa: int = 0) -> str:
+        if tentativa == 0:
+            return f"""
+📈 **REALIZANDO OPERAÇÃO**
+
+📊 **Ativo:** {ativo}
+🎯 **Direção:** {direcao.upper()}
+💵 **Valor:** R$ {valor:,.2f}
+⏰ **Expiração:** {tempo}min
+
+⏳ Aguarde o fechamento da vela...
+            """
+        else:
+            return f"""
+🔄 **GALE {tentativa}**
+
+📊 **Ativo:** {ativo}
+🎯 **Direção:** {direcao.upper()}
+💵 **Valor:** R$ {valor:,.2f}
+⏰ **Expiração:** {tempo}min
+
+⏳ Aguarde o fechamento da vela...
+            """
+
+    @staticmethod
+    def aguardando_vela(ts: str, antec: int) -> str:
+        return f"""
+🕯️ **AGUARDANDO VELA**
+
+⏱️ Entrada programada: **{ts}**
+⏳ Antecipação: {antec}s antes do fechamento
+
+Aguardando momento ideal para entrada...
+        """
+
+    @staticmethod
+    def resultado_operacao(r: dict, s: dict) -> str:
+        win = r.get('win', False)
+        titulo = "🟢 APURAÇÃO QUANTUM 🟢" if win else "🔴 APURAÇÃO QUANTUM 🔴"
+        ico = "✅" if win else "⛔"
+        cor = "🟩" if win else "🟥"
         
-        return status
-    
-    def formatar_seq(self, seq):
-        if seq > 0: return f"🔥 +{seq}"
-        elif seq < 0: return f"❄️ {seq}"
-        return "⚖️ 0"
+        tipo = r.get('tipo', 'SEM GALE')
+        gales = r.get('gales_usados', 0)
+        mult = r.get('multiplicador_usado', 1.0)
+        
+        ginfo = ""
+        if gales > 0:
+            ginfo = f"\n✖️ Multiplicador: {mult}x | Gale #{gales}"
+        
+        profit = r.get('profit', 0)
+        daily = s.get('daily_profit', 0)
+        ativo = r.get('ativo', '—')
+        direcao = r.get('direcao', '—').upper()
+        tempo = r.get('tempo', 1)
+        valor_entrada = r.get('valor_entrada_usado', 0)
+        conta = r.get('tipo_conta', '—').upper()
+
+        return f"""
+{titulo}
+
+════ {tipo.upper()} ════
+
+{ico} **M{tempo} {ativo} {direcao}**{ginfo}
+
+💵 **Entrada:** R$ {valor_entrada:,.2f}
+💲 **Resultado:** {'+' if win else ''}{profit:,.2f} USD
+
+{cor} **Resultado Diário:**
+**{daily:,.2f} USD**
+
+🏦 **Conta:**
+**{conta}**
+
+════════════════════════
+        """
+
+    @staticmethod
+    def aguardando_sinais() -> str:
+        return """
+⏳ **MONITORANDO CANAL DE SINAIS...**
+
+📡 Aguardando nova operação...
+        """
+
+    @staticmethod
+    def erro_operacao(erro: str) -> str:
+        return f"""
+❌ **ERRO NA OPERAÇÃO**
+
+{erro}
+
+════════════════════════
+        """
+
+
+# ==================== CONFIG ====================
 
 class ConfigManager:
-    def __init__(self, user_id):
-        self.user_id = str(user_id)
-        self.config_file = os.path.join(CONFIG_DIR, f'config_{self.user_id}.json')
-        self.config = self.load_config()
-    
-    def load_config(self):
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, 'r') as f:
-                    return json.load(f)
-            except:
-                return self.get_default_config()
-        return self.get_default_config()
-    
-    def get_default_config(self):
+    DEFAULTS = {
+        "email": None, "senha": None,
+        "valor_entrada": 5.0, "gales": 2,
+        "multiplicador": 2.0,
+        "antecipacao": 5,
+        "sincronizar_vela": True,
+        "stop_win": 100.0, "stop_loss": 50.0,
+        "tipo_conta": "real", "canal_id": None,
+        "modo_automatico": False, "configurado": False,
+    }
+
+    def __init__(self):
+        self.config = self._load()
+
+    def _load(self) -> dict:
+        if Path(CONFIG_FILE).exists():
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for k, v in self.DEFAULTS.items():
+                data.setdefault(k, v)
+            return data
+        return dict(self.DEFAULTS)
+
+    def _save(self):
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.config, f, indent=4, ensure_ascii=False)
+
+    def get(self, key, default=None):
+        return self.config.get(key, default)
+
+    def set(self, key, value):
+        self.config[key] = value
+        self._save()
+
+    @property
+    def configurado(self) -> bool:
+        return bool(self.config.get("configurado"))
+
+
+# ==================== STATS ====================
+
+class StatsManager:
+    def __init__(self):
+        self.stats = self._load()
+        self._reset_diario()
+
+    def _load(self) -> dict:
+        if Path(STATS_FILE).exists():
+            with open(STATS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
         return {
-            "email": "",
-            "password": "",
-            "account_type": "PRACTICE",
-            "valor_entrada": 5.0,
-            "multiplicador_gale": 2.0,
-            "max_gales": 1,
-            "stop_loss": 0,
-            "stop_win": 0,
-            "confianca_minima": 0,
-            "score_minimo": 0,
-            "ativo": False
+            "daily_profit": 0.0, "daily_trades": 0, "daily_wins": 0, "daily_losses": 0,
+            "total_profit": 0.0, "total_trades": 0, "total_wins": 0, "total_losses": 0,
+            "ultimo_reset": datetime.now().strftime("%Y-%m-%d")
         }
-    
-    def save_config(self):
-        with open(self.config_file, 'w') as f:
-            json.dump(self.config, f, indent=2)
-    
-    def get_config(self):
-        return self.config
-    
-    def is_active(self):
-        return self.config.get('ativo', False)
-    
-    def set_active(self, status):
-        self.config['ativo'] = status
-        self.save_config()
 
-# ============ API IQ OPTION SIMPLIFICADA ============
+    def _save(self):
+        with open(STATS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.stats, f, indent=4, ensure_ascii=False)
 
-class SimpleIQOption:
-    """API simplificada para IQ Option usando apenas requests"""
-    
-    def __init__(self, email, password):
-        self.email = email
-        self.password = password
-        self.session = requests.Session()
-        self.ssid = None
-        self.logged_in = False
-        self.balance = 0
-        self.user_id = None
-        self.token = None
-        
-        # Headers padrão
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json',
-            'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
-            'Origin': 'https://iqoption.com',
-            'Referer': 'https://iqoption.com/pt/',
-        })
-    
-    def login(self):
-        """Faz login na IQ Option"""
-        try:
-            # Primeiro, pegar o SSID
-            login_url = "https://auth.iqoption.com/api/v1/login"
-            
-            payload = {
-                "email": self.email,
-                "password": self.password
-            }
-            
-            response = self.session.post(login_url, json=payload, timeout=30)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('code') == 0:
-                    self.logged_in = True
-                    self.user_id = data.get('data', {}).get('user_id')
-                    self.token = data.get('data', {}).get('token')
-                    
-                    # Atualizar headers com token
-                    self.session.headers.update({
-                        'Authorization': f'Bearer {self.token}'
-                    })
-                    
-                    # Buscar saldo
-                    self._update_balance()
-                    
-                    return True, "✅ Login realizado com sucesso!"
-                else:
-                    return False, f"❌ Erro no login: {data.get('msg', 'Erro desconhecido')}"
-            else:
-                return False, f"❌ Erro HTTP: {response.status_code}"
-                
-        except Exception as e:
-            logger.error(f"Erro no login: {e}")
-            return False, f"❌ Erro: {str(e)}"
-    
-    def _update_balance(self):
-        """Atualiza o saldo"""
-        try:
-            response = self.session.get(
-                "https://iqoption.com/api/getbalance",
-                timeout=30
-            )
-            if response.status_code == 200:
-                data = response.json()
-                self.balance = data.get('data', {}).get('balance', 0)
-            return self.balance
-        except:
-            return self.balance
-    
-    def get_balance(self):
-        """Retorna o saldo atual"""
-        self._update_balance()
-        return self.balance
-    
-    def get_asset_id(self, asset_name):
-        """Converte nome do ativo para ID"""
-        assets = {
-            'EURUSD': 1, 'EURUSD-OTC': 1,
-            'GBPUSD': 2, 'GBPUSD-OTC': 2,
-            'USDJPY': 3, 'USDJPY-OTC': 3,
-            'AUDUSD': 4, 'AUDUSD-OTC': 4,
-            'USDCAD': 5, 'USDCAD-OTC': 5,
-            'USDCHF': 6, 'USDCHF-OTC': 6,
-            'NZDUSD': 7, 'NZDUSD-OTC': 7,
-            'BTCUSD': 8, 'BTCUSD-OTC': 8,
-            'ETHUSD': 9, 'ETHUSD-OTC': 9,
-            'LTCUSD': 10, 'LTCUSD-OTC': 10,
-            'XRPUSD': 11, 'XRPUSD-OTC': 11,
-        }
-        return assets.get(asset_name.upper(), 1)
-    
-    def buy(self, amount, asset, direction, expiry):
-        """Executa uma operação"""
-        if not self.logged_in:
-            return False, "Não conectado"
-        
-        try:
-            asset_id = self.get_asset_id(asset)
-            direction_value = 1 if direction.lower() == 'call' else 2
-            expiry_seconds = expiry * 60
-            
-            payload = {
-                "asset_id": asset_id,
-                "amount": float(amount),
-                "direction": direction_value,
-                "expiry": expiry_seconds,
-                "type": 1  # 1 = binária
-            }
-            
-            response = self.session.post(
-                "https://iqoption.com/api/buy",
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('code') == 0:
-                    order_id = data.get('data', {}).get('order_id')
-                    return True, order_id
-                else:
-                    return False, data.get('msg', 'Erro na operação')
-            else:
-                return False, f"Erro HTTP: {response.status_code}"
-                
-        except Exception as e:
-            logger.error(f"Erro ao comprar: {e}")
-            return False, str(e)
-    
-    def check_win(self, order_id):
-        """Verifica resultado de uma operação"""
-        try:
-            response = self.session.get(
-                f"https://iqoption.com/api/get-result/{order_id}",
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('code') == 0:
-                    result_data = data.get('data', {})
-                    profit = result_data.get('profit', 0)
-                    status = result_data.get('status', '')
-                    
-                    if profit > 0:
-                        return 'win', profit
-                    elif profit < 0:
-                        return 'loose', abs(profit)
-                    else:
-                        return 'equal', 0
-                else:
-                    return 'erro', 0
-            return 'erro', 0
-        except Exception as e:
-            logger.error(f"Erro ao verificar: {e}")
-            return 'erro', 0
+    def _reset_diario(self):
+        hoje = datetime.now().strftime("%Y-%m-%d")
+        if self.stats["ultimo_reset"] != hoje:
+            self.stats.update(daily_profit=0.0, daily_trades=0,
+                              daily_wins=0, daily_losses=0, ultimo_reset=hoje)
+            self._save()
 
-class IQOperador:
-    def __init__(self, config):
-        self.cfg = config
-        self.api = None
-        self.painel = PainelOperacoes()
-        self.lucro_dia = 0.0
-        self.operacoes = 0
-        self.wins = 0
-        self.losses = 0
-        self.gales_usados = 0
-        self.conectado = False
+    def add(self, win: bool, profit: float):
+        self._reset_diario()
+        self.stats["daily_trades"] += 1
+        self.stats["total_trades"] += 1
+        self.stats["daily_profit"] += profit
+        self.stats["total_profit"] += profit
+        if win:
+            self.stats["daily_wins"] += 1
+            self.stats["total_wins"] += 1
+        else:
+            self.stats["daily_losses"] += 1
+            self.stats["total_losses"] += 1
+        self._save()
 
-    def conectar(self):
-        try:
-            if not self.cfg['email'] or not self.cfg['password']:
-                return False, "❌ Email ou senha não configurados!"
-            
-            logger.info(f"🔄 Conectando IQ Option...")
-            
-            self.api = SimpleIQOption(self.cfg['email'], self.cfg['password'])
-            success, msg = self.api.login()
-            
-            if not success:
-                return False, msg
-            
-            self.conectado = True
-            balance = self.api.get_balance()
-            logger.info(f"✅ Conectado! Saldo: R$ {balance:.2f}")
-            return True, f"✅ Conectado! Saldo: R$ {balance:.2f}"
-            
-        except Exception as e:
-            logger.error(f"❌ Erro na conexão: {e}")
-            self.conectado = False
-            return False, f"❌ Erro: {str(e)}"
+    def get_stats(self) -> dict:
+        self._reset_diario()
+        return self.stats
 
-    def operar(self, sinal, bot, chat_id):
-        if not self.conectado:
-            return "❌ Bot não conectado. Use /iniciar para reconectar."
-        
-        cfg = self.cfg
-        ativo = sinal["ativo"]
-        direcao = sinal["direcao"]
-        exp = sinal.get("expiracao", 1)
-        valor = cfg["valor_entrada"]
-        max_gales = min(sinal.get("gales", 0), cfg["max_gales"])
 
-        if cfg["stop_loss"] > 0 and self.lucro_dia <= -cfg["stop_loss"]:
-            return f"🛑 Stop Loss atingido! Lucro: R$ {self.lucro_dia:.2f}"
-        
-        if cfg["stop_win"] > 0 and self.lucro_dia >= cfg["stop_win"]:
-            return f"🏆 Stop Win atingido! Lucro: R$ {self.lucro_dia:.2f}"
+# ==================== PARSER DE SINAIS ====================
 
-        bot.send_message(chat_id, f"🎯 {ativo} | {direcao.upper()} | M{exp} | R$ {valor:.2f}")
+class SignalParser:
+    @staticmethod
+    def parse(texto: str) -> Dict[str, Any]:
+        r = {'ativo': None, 'direcao': None, 'tempo': 1, 'horario': None, 'valido': False}
 
-        tentativa = 0
-        resultado_final = ""
-        
-        while tentativa <= max_gales:
-            val_atual = round(valor * (cfg["multiplicador_gale"] ** tentativa), 2)
+        if any(kw in texto.upper() for kw in ["WIN", "LOSS", "✅", "⛔"]):
+            return r
 
-            if tentativa > 0:
-                self.gales_usados += 1
-                bot.send_message(chat_id, f"🔄 Gale {tentativa} → R$ {val_atual:.2f}")
-
-            try:
-                success, order_id = self.api.buy(val_atual, ativo, direcao, exp)
-                
-                if not success:
-                    return f"❌ Ordem rejeitada: {order_id}"
-
-                bot.send_message(chat_id, f"⏳ Aguardando resultado (M{exp})...")
-                time.sleep(exp * 60 + 5)
-                
-                status, lucro = self.api.check_win(order_id)
-                self.operacoes += 1
-
-                if status == "win":
-                    self.wins += 1
-                    self.lucro_dia += lucro
-                    resultado_final = f"✅ WIN! +R$ {lucro:.2f}"
-                    
-                    self.painel.adicionar({
-                        "hora": datetime.now().strftime("%H:%M:%S"),
-                        "ativo": ativo,
-                        "direcao": direcao,
-                        "status": "WIN",
-                        "valor": val_atual,
-                        "lucro": lucro,
-                        "gale": tentativa
-                    })
-                    
-                    bot.send_message(chat_id, resultado_final)
-                    break
-                    
-                elif status in ("loose", "loss"):
-                    self.losses += 1
-                    self.lucro_dia -= val_atual
-                    resultado_final = f"❌ LOSS! -R$ {val_atual:.2f}"
-                    
-                    self.painel.adicionar({
-                        "hora": datetime.now().strftime("%H:%M:%S"),
-                        "ativo": ativo,
-                        "direcao": direcao,
-                        "status": "LOSS",
-                        "valor": val_atual,
-                        "lucro": -val_atual,
-                        "gale": tentativa
-                    })
-                    
-                    bot.send_message(chat_id, resultado_final)
-                    
-                    tentativa += 1
-                    if tentativa > max_gales:
-                        bot.send_message(chat_id, "🚫 Sem mais gales.")
-                        
-                elif status == "equal":
-                    bot.send_message(chat_id, "〰️ EMPATE (doji)")
-                    break
-                else:
-                    bot.send_message(chat_id, f"Status: {status}")
-                    break
-
-            except Exception as e:
-                error_msg = f"❌ Erro: {str(e)}"
-                logger.error(error_msg)
-                bot.send_message(chat_id, error_msg)
+        for pat in [r"Ativo:\s*([^\n]+)", r"💰\s*Ativo:\s*([^\n]+)", r"Par:\s*([^\n]+)"]:
+            m = re.search(pat, texto, re.IGNORECASE)
+            if m:
+                r['ativo'] = re.sub(r'[^\w\s/.-]', '', m.group(1)).strip()
                 break
 
-        if self.operacoes > 0:
-            taxa = (self.wins / self.operacoes * 100) if self.operacoes > 0 else 0
-            summary = f"📊 {self.operacoes} ops | {self.wins}W/{self.losses}L | {taxa:.0f}% | R$ {self.lucro_dia:.2f}"
-            bot.send_message(chat_id, summary)
+        if "CALL" in texto.upper() or "COMPRA" in texto.upper():
+            r['direcao'] = 'CALL'
+        elif "PUT" in texto.upper() or "VENDA" in texto.upper():
+            r['direcao'] = 'PUT'
+        elif "🟢" in texto:
+            r['direcao'] = 'CALL'
+        elif "🔴" in texto:
+            r['direcao'] = 'PUT'
+
+        for pat in [r"Expiração:\s*([^\n]+)", r"⌛️?\s*Expiração:\s*([^\n]+)"]:
+            m = re.search(pat, texto, re.IGNORECASE)
+            if m:
+                t = m.group(1).strip().upper()
+                if 'M5' in t or '5MIN' in t:
+                    r['tempo'] = 5
+                elif 'M3' in t or '3MIN' in t:
+                    r['tempo'] = 3
+                elif 'M2' in t or '2MIN' in t:
+                    r['tempo'] = 2
+                else:
+                    r['tempo'] = 1
+                break
+
+        for pat in [r"Horário:\s*([^\n]+)", r"⏰\s*Horário:\s*([^\n]+)"]:
+            m = re.search(pat, texto, re.IGNORECASE)
+            if m:
+                r['horario'] = m.group(1).strip()
+                break
+
+        r['valido'] = bool(r['ativo'] and r['direcao'])
+        return r
+
+
+# ==================== MAPEAMENTO ATIVOS ====================
+
+class AtivoMapper:
+    MAPA = {
+        "PYTH": "PYTH", "NEAR": "NEAR", "SAND": "SAND", "SEI": "SEI",
+        "ICP": "ICP", "INJ": "INJ", "APT": "APT", "SUI": "SUI",
+        "ARB": "ARB", "OP": "OP", "EOS": "EOS", "STX": "STX",
+        "IOTA": "IOTA", "TIA": "TIA", "DOT": "DOT", "LINK": "LINK",
+        "UNI": "UNI", "AVAX": "AVAX", "ATOM": "ATOM", "MATIC": "MATIC",
+        "SOL": "SOL", "FLOKI": "FLOKI", "BONK": "BONK", "SHIB": "SHIB",
+        "PEPE": "PEPE", "DOGE": "DOGE", "LTC": "LTC", "TRX": "TRX",
+        "ADA": "ADA", "BNB": "BNB", "BTC": "BTC", "ETH": "ETH", "XRP": "XRP",
+        "AAPL": "AAPL-OTC", "APPLE": "AAPL-OTC", "TSLA": "TSLA-OTC",
+        "TESLA": "TSLA-OTC", "AMZN": "AMZN-OTC", "AMAZON": "AMZN-OTC",
+        "GOOGL": "GOOGL-OTC", "GOOGLE": "GOOGL-OTC", "MSFT": "MSFT-OTC",
+        "MICROSOFT": "MSFT-OTC", "META": "META-OTC", "FACEBOOK": "META-OTC",
+        "NVDA": "NVDA-OTC", "NVIDIA": "NVDA-OTC",
+        "US30": "US30-OTC", "DOW": "US30-OTC",
+        "NASDAQ": "NAS100-OTC", "NAS100": "NAS100-OTC",
+        "SP500": "SPX500-OTC", "SPX": "SPX500-OTC",
+        "DAX": "DAX-OTC", "GERMANY30": "DAX-OTC",
+        "FTSE": "FTSE-OTC", "UK100": "FTSE-OTC",
+        "NIKKEI": "NIKKEI-OTC", "JAPAN225": "NIKKEI-OTC",
+        "CAC": "CAC-OTC", "FRANCE40": "CAC-OTC",
+        "XAUUSD": "XAUUSD-OTC", "GOLD": "XAUUSD-OTC",
+        "XAGUSD": "XAGUSD-OTC", "SILVER": "XAGUSD-OTC",
+        "WTI": "WTI-OTC", "USOUSD": "WTI-OTC",
+        "BRENT": "BRENT-OTC", "UKOUSD": "BRENT-OTC",
+        "USDCAD-OTC": "USDCAD-OTC", "EURUSD-OTC": "EURUSD-OTC",
+        "GBPUSD-OTC": "GBPUSD-OTC", "USDJPY-OTC": "USDJPY-OTC",
+        "USDCHF-OTC": "USDCHF-OTC", "AUDUSD-OTC": "AUDUSD-OTC",
+        "NZDUSD-OTC": "NZDUSD-OTC", "EURGBP-OTC": "EURGBP-OTC",
+        "EURJPY-OTC": "EURJPY-OTC", "GBPJPY-OTC": "GBPJPY-OTC",
+        "AUDCAD-OTC": "AUDCAD-OTC",
+        "EURUSD": "EURUSD", "GBPUSD": "GBPUSD",
+        "USDJPY": "USDJPY", "AUDUSD": "AUDUSD",
+        "USDCAD": "USDCAD", "USDCHF": "USDCHF",
+        "NZDUSD": "NZDUSD", "EURGBP": "EURGBP",
+        "EURJPY": "EURJPY", "GBPJPY": "GBPJPY",
+        "AUDCAD": "AUDCAD",
+    }
+
+    @classmethod
+    def mapear(cls, ativo: str) -> Tuple[Optional[str], str]:
+        if not ativo:
+            return None, "DIGITAL"
+        up = ativo.upper()
+        mapped = cls.MAPA.get(up)
+        if not mapped:
+            for k, v in cls.MAPA.items():
+                if k in up or up in k:
+                    mapped = v
+                    break
+        if not mapped:
+            mapped = ativo.replace("/", "")
+        modo = "OTC" if "-OTC" in mapped else "DIGITAL"
+        logger.info(f"Mapeamento: {ativo} → {mapped} ({modo})")
+        return mapped, modo
+
+
+# ==================== SYNC DE VELA ====================
+
+class VelaSync:
+    @staticmethod
+    def proximo_inicio(tempo_min: int, agora: datetime = None) -> datetime:
+        if agora is None:
+            agora = datetime.now()
+        seg_total = agora.minute * 60 + agora.second + agora.microsecond / 1e6
+        bloco_seg = tempo_min * 60
+        ja_passou = seg_total % bloco_seg
+        faltam = bloco_seg - ja_passou
+        return agora + timedelta(seconds=faltam)
+
+    @staticmethod
+    async def aguardar(tempo_min: int, antecipacao_s: int, msg_fn):
+        agora = datetime.now()
+        proximo = VelaSync.proximo_inicio(tempo_min, agora)
+        momento_entrar = proximo - timedelta(seconds=antecipacao_s)
+        espera = (momento_entrar - agora).total_seconds()
+
+        if espera <= 0:
+            proximo = proximo + timedelta(minutes=tempo_min)
+            momento_entrar = proximo - timedelta(seconds=antecipacao_s)
+            espera = (momento_entrar - agora).total_seconds()
+
+        if espera > 300:
+            logger.warning(f"Espera de vela longa ({espera:.0f}s) — entrada imediata")
+            return
+
+        if espera > 2:
+            ts = momento_entrar.strftime("%H:%M:%S")
+            await msg_fn(UI.aguardando_vela(ts, antecipacao_s))
+            await asyncio.sleep(espera)
+
+        logger.info(f"Momento de entrada: {datetime.now().strftime('%H:%M:%S.%f')}")
+
+
+# ==================== IQ TRADER COM NOVA API ====================
+
+class IQTrader:
+    def __init__(self, config: ConfigManager, stats: StatsManager, bot):
+        self.config = config
+        self.stats = stats
+        self.bot = bot
+        self.api = None
+        self.conectado = False
+        self.saldo = 0.0
+        self.tipo_conta = "real"
+
+    async def conectar(self, email: str, senha: str, tipo: str = "real") -> bool:
+        try:
+            await self.bot.msg("🔄 Conectando na IQ Option com nova API...")
+            try:
+                from iqoptionapi.iqapi import IQOptionClient
+                from iqoptionapi.models import OptionsTradeParams, Direction, OptionType
+            except ImportError:
+                await self.bot.msg("❌ iqoptionapi não instalada!\n📦 pip install iqoptionapi")
+                return False
+
+            # Criar cliente
+            account_type = 'demo' if tipo == "treinamento" else 'real'
+            self.api = IQOptionClient(email, senha, account_type=account_type)
+            
+            # Conectar
+            self.api.connect()
+            
+            # Verificar conexão
+            balance = self.api.get_balance()
+            self.conectado = True
+            self.saldo = balance
+            self.tipo_conta = tipo
+            
+            self.config.set("email", email)
+            self.config.set("tipo_conta", tipo)
+            
+            await self.bot.msg(
+                f"✅ Conectado com sucesso!\n\n"
+                f"💰 Saldo: R$ {balance:,.2f}\n"
+                f"🏦 Conta: {tipo.upper()}"
+            )
+            return True
+            
+        except Exception as e:
+            await self.bot.msg(f"❌ Erro ao conectar: {e}")
+            logger.error(f"Erro conexão: {e}")
+            return False
+
+    async def executar(self, ativo: str, direcao: str, tempo: int, skip_sinc: bool = False) -> dict:
+        if not self.conectado or not self.api:
+            return {"sucesso": False, "erro": "Não conectado"}
+
+        s = self.stats.get_stats()
+        stop_loss = self.config.get("stop_loss", 50.0)
+        stop_win = self.config.get("stop_win", 100.0)
+        daily = s['daily_profit']
+
+        if daily <= -stop_loss:
+            msg = f"🛑 Stop Loss atingido: R$ {stop_loss:,.2f}"
+            await self.bot.msg(msg)
+            return {"sucesso": False, "erro": "Stop Loss atingido"}
+
+        if daily >= stop_win:
+            msg = f"🎯 Stop Win atingido: R$ {stop_win:,.2f}"
+            await self.bot.msg(msg)
+            return {"sucesso": False, "erro": "Stop Win atingido"}
+
+        ativo_iq, modo = AtivoMapper.mapear(ativo)
+        if not ativo_iq:
+            return {"sucesso": False, "erro": f"Ativo '{ativo}' não mapeado"}
+
+        # Direção para a nova API
+        direction = Direction.CALL if direcao.upper() == "CALL" else Direction.PUT
         
-        return resultado_final
+        valor_base = self.config.get("valor_entrada", 5.0)
+        gales = self.config.get("gales", 2)
+        multiplicador = self.config.get("multiplicador", 2.0)
+        antecipacao = self.config.get("antecipacao", 5)
+        sinc_vela = self.config.get("sincronizar_vela", True)
 
-def parse_sinal(texto):
-    if "SINAL" not in texto.upper():
-        return None
+        if sinc_vela and not skip_sinc:
+            await VelaSync.aguardar(tempo, antecipacao, self.bot.msg)
 
-    sinal = {}
+        valor_atual = valor_base
+        gales_usados = 0
+        tipo_res = "SEM GALE"
+        perda_acumulada = 0.0
 
-    m = re.search(r'Hor[aá]rio[:\s]+(\d{1,2}:\d{2})', texto)
-    if m:
-        sinal["horario"] = m.group(1)
+        for tentativa in range(gales + 1):
 
-    m = re.search(r'Ativo[:\s]+([\w\-\/]+)', texto)
-    if m:
-        sinal["ativo"] = m.group(1).strip()
+            if tentativa > 0:
+                valor_atual = valor_base * (multiplicador ** tentativa)
+                gales_usados = tentativa
+                tipo_res = f"WIN G{tentativa}"
+                ts_agora = datetime.now().strftime("%H:%M:%S")
+                await self.bot.msg(
+                    f"🔴 Loss na tentativa anterior!\n\n"
+                    f"🔄 **GALE {tentativa}**\n"
+                    f"✖️ {multiplicador}x → R$ {valor_atual:.2f}\n"
+                    f"⚡ Entrada: **{ts_agora}**"
+                )
 
-    if "CALL" in texto.upper():
-        sinal["direcao"] = "call"
-    elif "PUT" in texto.upper():
-        sinal["direcao"] = "put"
+            try:
+                saldo_antes = self.api.get_balance()
+                agora_buy = datetime.now()
 
-    m = re.search(r'Expira[çc][aã]o[:\s]+M(\d+)', texto, re.IGNORECASE)
-    sinal["expiracao"] = int(m.group(1)) if m else 1
+                candle_start = VelaSync.proximo_inicio(tempo, agora_buy)
+                candle_close = candle_start + timedelta(minutes=tempo)
 
-    m = re.search(r'Confian[çc]a[:\s]+(\d+)%', texto, re.IGNORECASE)
-    if m:
-        sinal["confianca"] = int(m.group(1))
+                logger.info(
+                    f"[T{tentativa}] Comprando R${valor_atual:.2f} "
+                    f"em {ativo_iq} ({direction}) {tempo}min | "
+                    f"vela fecha {candle_close.strftime('%H:%M:%S')}"
+                )
 
-    m = re.search(r'Score\s+IA[:\s]+(\d+)/100', texto, re.IGNORECASE)
-    if m:
-        sinal["score"] = int(m.group(1))
+                # Envia mensagem de operação
+                await self.bot.msg(UI.operacao_executando(
+                    valor_atual, ativo, direcao, tempo, tentativa
+                ))
 
-    m = re.search(r'(\d+)\s+recupera[çc][aã]o', texto, re.IGNORECASE)
-    sinal["gales"] = int(m.group(1)) if m else 0
+                # Usar a nova API para executar trade
+                from iqoptionapi.models import OptionsTradeParams, OptionType
+                
+                trade_params = OptionsTradeParams(
+                    asset=ativo_iq,
+                    expiry=tempo,
+                    amount=valor_atual,
+                    direction=direction,
+                    option_type=OptionType.BINARY_OPTION
+                )
 
-    if "ativo" in sinal and "direcao" in sinal:
-        return sinal
-    return None
+                success, order_id = self.api.execute_options_trade(trade_params)
 
-# ============ HANDLERS DO TELEGRAM ============
+                if not success:
+                    await self.bot.msg(f"❌ Falha na execução: {order_id}")
+                    return {"sucesso": False, "erro": f"Falha ao comprar: {order_id}"}
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    config_manager = ConfigManager(user_id)
-    config = config_manager.get_config()
-    
-    if config['email'] and config['password']:
-        msg = (
-            f"🤖 Quantum Bot - Configuração Existente\n\n"
-            f"📧 Email: {config['email']}\n"
-            f"💳 Conta: {config['account_type']}\n"
-            f"💰 Entrada: R$ {config['valor_entrada']:.2f}\n"
-            f"🔄 Gale: {config['multiplicador_gale']}x (max {config['max_gales']})\n"
-            f"🛑 Stop Loss: R$ {config['stop_loss']:.2f}\n"
-            f"🏆 Stop Win: R$ {config['stop_win']:.2f}\n"
-            f"🔍 Confiança: {config['confianca_minima']}%\n"
-            f"🛡️ Score: {config['score_minimo']}/100\n\n"
-            f"📌 Comandos:\n"
-            f"/start - Menu\n"
-            f"/config - Reconfigurar\n"
-            f"/status - Estatísticas\n"
-            f"/stop - Parar bot\n"
-            f"/iniciar - Iniciar bot\n\n"
-            f"ℹ️ Envie 'SINAL' para operar"
-        )
-        await update.message.reply_text(msg)
-        return ConversationHandler.END
-    
-    await update.message.reply_text(
-        "🤖 Bem-vindo ao Quantum Bot!\n\n"
-        "Vamos configurar seu bot passo a passo.\n"
-        "Digite /cancel para cancelar.\n\n"
-        "📧 Digite seu email da IQ Option:"
-    )
-    return EMAIL
+                ts_close = candle_close.strftime("%H:%M:%S")
+                await self.bot.msg(
+                    f"⏳ Aguardando fechamento da vela: **{ts_close}**"
+                )
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Configuração cancelada.")
-    return ConversationHandler.END
+                espera = (candle_close - datetime.now()).total_seconds() - 1
+                if espera > 0:
+                    await asyncio.sleep(espera)
 
-async def get_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    email = update.message.text.strip()
-    if '@' not in email:
-        await update.message.reply_text("⚠️ Email inválido. Digite novamente:")
-        return EMAIL
-    
-    context.user_data['email'] = email
-    await update.message.reply_text(f"📧 Email: {email}\n\n🔑 Digite sua senha:")
-    return PASSWORD
+                # Verificar resultado usando a nova API
+                profit = None
+                if order_id:
+                    for _ in range(40):
+                        try:
+                            success, outcome, pnl = self.api.get_trade_outcome(order_id, tempo)
+                            if success:
+                                profit = pnl
+                                break
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.2)
 
-async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    password = update.message.text.strip()
-    if len(password) < 4:
-        await update.message.reply_text("⚠️ Senha muito curta. Digite novamente:")
-        return PASSWORD
-    
-    context.user_data['password'] = password
-    await update.message.reply_text(
-        f"🔑 Senha: {'*' * len(password)}\n\n"
-        f"💳 Tipo de conta:\n"
-        f"Digite '1' para DEMO ou '2' para REAL"
-    )
-    return ACCOUNT_TYPE
+                if profit is None:
+                    await asyncio.sleep(2)
+                    saldo_atual = self.api.get_balance()
+                    profit = saldo_atual - saldo_antes
+                else:
+                    saldo_atual = self.api.get_balance()
 
-async def get_account_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    choice = update.message.text.strip()
-    
-    if choice == '1':
-        account_type = 'PRACTICE'
-    elif choice == '2':
-        account_type = 'REAL'
-    else:
-        await update.message.reply_text("⚠️ Digite '1' para DEMO ou '2' para REAL:")
-        return ACCOUNT_TYPE
-    
-    context.user_data['account_type'] = account_type
-    await update.message.reply_text(
-        f"💳 Conta: {account_type}\n\n"
-        f"💰 Valor de entrada (mínimo R$ 1.00):"
-    )
-    return VALOR_ENTRADA
+                self.saldo = saldo_atual
+                delta = profit
 
-async def get_valor_entrada(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        valor = float(update.message.text.strip())
-        if valor < 1:
-            await update.message.reply_text("⚠️ Valor mínimo é R$ 1.00. Digite novamente:")
-            return VALOR_ENTRADA
-        
-        context.user_data['valor_entrada'] = valor
-        await update.message.reply_text(
-            f"💰 Entrada: R$ {valor:.2f}\n\n"
-            f"🔄 Multiplicador do Gale (ex: 2.0):"
-        )
-        return MULTIPLICADOR_GALE
-    except ValueError:
-        await update.message.reply_text("❌ Digite um número válido.")
-        return VALOR_ENTRADA
+                logger.info(f"[T{tentativa}] Resultado: {delta:+.2f} | saldo {saldo_atual:.2f}")
 
-async def get_multiplicador_gale(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        multi = float(update.message.text.strip())
-        if multi < 1:
-            await update.message.reply_text("⚠️ Multiplicador deve ser >= 1:")
-            return MULTIPLICADOR_GALE
-        
-        context.user_data['multiplicador_gale'] = multi
-        await update.message.reply_text(
-            f"🔄 Multiplicador: {multi}x\n\n"
-            f"📊 Número máximo de Gales:"
-        )
-        return MAX_GALES
-    except ValueError:
-        await update.message.reply_text("❌ Digite um número válido.")
-        return MULTIPLICADOR_GALE
+                if delta > 0:
+                    # WIN
+                    profit_final = delta - perda_acumulada
+                    self.stats.add(True, profit_final)
+                    r = {
+                        "sucesso": True, "win": True,
+                        "profit": profit_final,
+                        "ativo": ativo, "direcao": direcao,
+                        "tempo": tempo,
+                        "tipo": tipo_res if gales_usados else "SEM GALE",
+                        "gales_usados": gales_usados,
+                        "multiplicador_usado": multiplicador,
+                        "valor_entrada_usado": valor_atual,
+                        "saldo": self.saldo,
+                        "tipo_conta": self.tipo_conta
+                    }
+                    await self.bot.msg(UI.resultado_operacao(r, self.stats.get_stats()))
+                    return r
 
-async def get_max_gales(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        max_gales = int(update.message.text.strip())
-        if max_gales < 0:
-            await update.message.reply_text("⚠️ Digite um número >= 0:")
-            return MAX_GALES
-        
-        context.user_data['max_gales'] = max_gales
-        await update.message.reply_text(
-            f"📊 Max Gales: {max_gales}\n\n"
-            f"🛑 Stop Loss (0 para desativar):"
-        )
-        return STOP_LOSS
-    except ValueError:
-        await update.message.reply_text("❌ Digite um número inteiro.")
-        return MAX_GALES
+                elif delta < 0:
+                    perda_acumulada += abs(delta)
+                    if tentativa < gales:
+                        await self.bot.msg(f"🔴 Loss na tentativa {tentativa+1} — ativando próximo gale...")
+                        continue
+                    else:
+                        self.stats.add(False, -perda_acumulada)
+                        r = {
+                            "sucesso": False, "win": False,
+                            "profit": -perda_acumulada,
+                            "ativo": ativo, "direcao": direcao,
+                            "tempo": tempo,
+                            "tipo": "LOSS",
+                            "gales_usados": gales_usados,
+                            "multiplicador_usado": multiplicador,
+                            "valor_entrada_usado": valor_atual,
+                            "saldo": self.saldo,
+                            "tipo_conta": self.tipo_conta
+                        }
+                        await self.bot.msg(UI.resultado_operacao(r, self.stats.get_stats()))
+                        return r
 
-async def get_stop_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        stop_loss = float(update.message.text.strip())
-        if stop_loss < 0:
-            await update.message.reply_text("⚠️ Digite um número >= 0:")
-            return STOP_LOSS
-        
-        context.user_data['stop_loss'] = stop_loss
-        await update.message.reply_text(
-            f"🛑 Stop Loss: R$ {stop_loss:.2f}\n\n"
-            f"🏆 Stop Win (0 para desativar):"
-        )
-        return STOP_WIN
-    except ValueError:
-        await update.message.reply_text("❌ Digite um número válido.")
-        return STOP_LOSS
+                else:
+                    await self.bot.msg("⚠️ Saldo inalterado — verifique a plataforma.")
+                    return {"sucesso": False, "erro": "Saldo inalterado"}
 
-async def get_stop_win(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        stop_win = float(update.message.text.strip())
-        if stop_win < 0:
-            await update.message.reply_text("⚠️ Digite um número >= 0:")
-            return STOP_WIN
-        
-        context.user_data['stop_win'] = stop_win
-        await update.message.reply_text(
-            f"🏆 Stop Win: R$ {stop_win:.2f}\n\n"
-            f"🔍 Confiança mínima (0 para ignorar):"
-        )
-        return CONFIANCE
-    except ValueError:
-        await update.message.reply_text("❌ Digite um número válido.")
-        return STOP_WIN
+            except Exception as e:
+                logger.error(f"Erro na ordem T{tentativa}: {e}")
+                await self.bot.msg(f"❌ Erro: {e}")
+                return {"sucesso": False, "erro": str(e)}
 
-async def get_confiance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        confiance = int(update.message.text.strip())
-        if confiance < 0 or confiance > 100:
-            await update.message.reply_text("⚠️ Digite entre 0 e 100:")
-            return CONFIANCE
-        
-        context.user_data['confianca_minima'] = confiance
-        await update.message.reply_text(
-            f"🔍 Confiança: {confiance}%\n\n"
-            f"🛡️ Score mínimo (0 para ignorar):"
-        )
-        return SCORE
-    except ValueError:
-        await update.message.reply_text("❌ Digite um número inteiro.")
-        return CONFIANCE
+        return {"sucesso": False, "erro": "Loop de gales finalizado"}
 
-async def get_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        score = int(update.message.text.strip())
-        if score < 0 or score > 100:
-            await update.message.reply_text("⚠️ Digite entre 0 e 100:")
-            return SCORE
-        
-        context.user_data['score_minimo'] = score
-        
-        user_id = update.effective_user.id
-        config_manager = ConfigManager(user_id)
-        config = config_manager.get_config()
-        
-        for key in ['email', 'password', 'account_type', 'valor_entrada', 
-                   'multiplicador_gale', 'max_gales', 'stop_loss', 'stop_win',
-                   'confianca_minima', 'score_minimo']:
-            if key in context.user_data:
-                config[key] = context.user_data[key]
-        
-        config_manager.save_config()
-        
-        summary = (
-            f"✅ CONFIGURAÇÃO CONCLUÍDA!\n\n"
-            f"📧 Email: {config['email']}\n"
-            f"💳 Conta: {config['account_type']}\n"
-            f"💰 Entrada: R$ {config['valor_entrada']:.2f}\n"
-            f"🔄 Gale: {config['multiplicador_gale']}x\n"
-            f"📊 Max Gales: {config['max_gales']}\n"
-            f"🛑 Stop Loss: R$ {config['stop_loss']:.2f}\n"
-            f"🏆 Stop Win: R$ {config['stop_win']:.2f}\n"
-            f"🔍 Confiança: {config['confianca_minima']}%\n"
-            f"🛡️ Score: {config['score_minimo']}/100\n\n"
-            f"Digite /iniciar para conectar!"
-        )
-        await update.message.reply_text(summary)
-        return ConversationHandler.END
-    except ValueError:
-        await update.message.reply_text("❌ Digite um número inteiro.")
-        return SCORE
 
-async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    config_manager = ConfigManager(user_id)
-    config = config_manager.get_config()
-    
-    if not config['email'] or not config['password']:
-        await update.message.reply_text("❌ Configure o bot primeiro com /start")
-        return
-    
-    operador = IQOperador(config)
-    success, msg = operador.conectar()
-    
-    if not success:
-        await update.message.reply_text(f"❌ {msg}\nUse /start para reconfigurar.")
-        return
-    
-    context.user_data['operador'] = operador
-    config_manager.set_active(True)
-    
-    await update.message.reply_text(
-        f"🚀 BOT INICIADO!\n\n"
-        f"✅ IQ Option Conectado\n"
-        f"📧 {config['email']}\n"
-        f"💰 Saldo: R$ {operador.api.get_balance():.2f}\n\n"
-        f"📌 Envie 'SINAL' para operar\n"
-        f"🔧 Comandos: /status, /stop"
-    )
+# ==================== BOT PRINCIPAL ====================
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    config_manager = ConfigManager(user_id)
-    config = config_manager.get_config()
-    operador = context.user_data.get('operador')
-    
-    if operador and operador.conectado:
-        status_text = (
-            f"🤖 STATUS DO BOT\n\n"
-            f"📧 Email: {config['email']}\n"
-            f"💳 Conta: {config['account_type']}\n"
-            f"💰 Entrada: R$ {config['valor_entrada']:.2f}\n"
-            f"🔄 Gale: {config['multiplicador_gale']}x\n"
-            f"🛑 Stop: L: R$ {config['stop_loss']:.2f} | W: R$ {config['stop_win']:.2f}\n"
-            f"🔍 Confiança: {config['confianca_minima']}%\n"
-            f"🛡️ Score: {config['score_minimo']}/100\n\n"
-            f"{operador.painel.get_status()}"
-        )
-        await update.message.reply_text(status_text)
-    else:
-        await update.message.reply_text("❌ Bot não está ativo. Use /iniciar.")
+class QuantumBot:
+    def __init__(self):
+        self.config = ConfigManager()
+        self.stats = StatsManager()
+        self.trader = IQTrader(self.config, self.stats, self)
+        self.parser = SignalParser()
+        self.client: Optional[TelegramClient] = None
+        self.user_id = None
+        self.processando = False
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    config_manager = ConfigManager(user_id)
-    config_manager.set_active(False)
-    
-    if 'operador' in context.user_data:
-        operador = context.user_data['operador']
-        operador.conectado = False
-    
-    await update.message.reply_text("⏹️ Bot parado com sucesso!")
-    
-    if 'operador' in context.user_data:
-        operador = context.user_data['operador']
-        if operador.operacoes > 0:
-            taxa = (operador.wins / operador.operacoes * 100) if operador.operacoes > 0 else 0
-            await update.message.reply_text(
-                f"📊 RESUMO FINAL\n\n"
-                f"📈 Total: {operador.operacoes}\n"
-                f"✅ Wins: {operador.wins}\n"
-                f"❌ Loss: {operador.losses}\n"
-                f"📊 Taxa: {taxa:.1f}%\n"
-                f"💰 Lucro: R$ {operador.lucro_dia:.2f}"
+        # Credenciais do Telegram (use variáveis de ambiente)
+        self.api_id = int(os.getenv("TG_API_ID", "22453120"))
+        self.api_hash = os.getenv("TG_API_HASH", "89826a4104518e9ed650cdb451ad8b53")
+        self.token = os.getenv("TELEGRAM_BOT_TOKEN")
+
+        self._states: Dict[int, str] = {}
+        self._data: Dict[int, dict] = {}
+
+    async def msg(self, texto: str):
+        if self.user_id:
+            try:
+                await self.client.send_message(self.user_id, texto)
+                logger.info(f"📤 Mensagem enviada: {texto[:50]}...")
+            except Exception as e:
+                logger.error(f"msg(): {e}")
+
+    async def msg_btn(self, texto: str, botoes: list):
+        if self.user_id:
+            try:
+                await self.client.send_message(self.user_id, texto, buttons=botoes)
+                logger.info(f"📤 Mensagem com botões enviada: {texto[:50]}...")
+            except Exception as e:
+                logger.error(f"msg_btn(): {e}")
+
+    async def run(self):
+        if not self.token:
+            logger.error("❌ TELEGRAM_BOT_TOKEN não configurado!")
+            return
+
+        self.client = TelegramClient("quantum_bot", self.api_id, self.api_hash)
+        await self.client.start(bot_token=self.token)
+        logger.info("✅ Bot conectado")
+
+        c = self.client
+        c.add_event_handler(self._h_start, events.NewMessage(pattern='/start'))
+        c.add_event_handler(self._h_menu, events.NewMessage(pattern='/menu'))
+        c.add_event_handler(self._h_config, events.NewMessage(pattern='/config'))
+        c.add_event_handler(self._h_status, events.NewMessage(pattern='/status'))
+        c.add_event_handler(self._h_stats, events.NewMessage(pattern='/stats'))
+        c.add_event_handler(self._h_startauto, events.NewMessage(pattern='/startauto'))
+        c.add_event_handler(self._h_stopauto, events.NewMessage(pattern='/stopauto'))
+        c.add_event_handler(self._h_reset, events.NewMessage(pattern='/resetstats'))
+        c.add_event_handler(self._h_help, events.NewMessage(pattern='/help'))
+        c.add_event_handler(self._h_text, events.NewMessage)
+        c.add_event_handler(self._h_callback, events.CallbackQuery)
+        c.add_event_handler(self._h_sinal, events.NewMessage)
+
+        await self.msg("🤖 **QUANTUM BOT v4.0** iniciado!\n\nDigite /menu para começar.")
+
+        await c.run_until_disconnected()
+
+    # ==================== HANDLERS ====================
+
+    async def _h_start(self, event):
+        self.user_id = event.sender_id
+        if not self.config.configurado:
+            await self._config_iniciar(event)
+        else:
+            await self._menu(event, reply=True)
+
+    async def _h_menu(self, event):
+        await self._menu(event, reply=True)
+
+    async def _h_config(self, event):
+        if not self.config.configurado:
+            await self._config_iniciar(event)
+        else:
+            await self._config_mostrar(event, reply=True)
+
+    async def _h_status(self, event):
+        await self._status(event, reply=True)
+
+    async def _h_stats(self, event):
+        await self._stats(event, reply=True)
+
+    async def _h_startauto(self, event):
+        if not self.trader.conectado:
+            await event.reply("⚠️ Conecte à IQ Option primeiro.\nUse /config e depois 🔗 Conectar IQ.")
+            return
+        self.config.set("modo_automatico", True)
+        await event.reply("✅ Modo automático **ATIVADO**!\n📡 Aguardando sinais do canal...")
+
+    async def _h_stopauto(self, event):
+        self.config.set("modo_automatico", False)
+        await event.reply("🛑 Modo automático **DESATIVADO**.")
+
+    async def _h_reset(self, event):
+        self.stats = StatsManager()
+        await event.reply("✅ Estatísticas resetadas!")
+
+    async def _h_help(self, event):
+        await self._help(event, reply=True)
+
+    # ==================== TEXTO E CALLBACK ====================
+
+    async def _h_text(self, event):
+        try:
+            if event.message.out or not event.is_private:
+                return
+            texto = (event.message.raw_text or "").strip()
+            if not texto or texto.startswith('/'):
+                return
+
+            uid = event.sender_id
+            estado = self._states.get(uid)
+
+            if estado is None:
+                return
+
+            # Configuração inicial (igual ao Robin Bot)
+            if estado == "email":
+                self._data[uid]["email"] = texto
+                self._states[uid] = "senha"
+                await event.reply("📌 **PASSO 2/9** — Digite sua **SENHA** da IQ Option:")
+
+            elif estado == "senha":
+                self._data[uid]["senha"] = texto
+                self._states[uid] = "valor"
+                await event.reply(
+                    "📌 **PASSO 3/9** — **VALOR BASE** de entrada (R$):\n_(ex: 5.00)_"
+                )
+
+            elif estado == "valor":
+                try:
+                    v = float(texto.replace(',', '.'))
+                    if v < 0.5:
+                        await event.reply("⚠️ Mínimo R$ 0,50. Tente novamente:")
+                        return
+                    self._data[uid]["valor"] = v
+                    self._states[uid] = "gales"
+                    await event.reply("📌 **PASSO 4/9** — Quantos **GALES**? (0–5)\n_(0 = sem gale)_")
+                except ValueError:
+                    await event.reply("❌ Número inválido. Ex: `5.00`")
+
+            elif estado == "gales":
+                try:
+                    g = int(texto)
+                    if not (0 <= g <= 5):
+                        await event.reply("❌ Digite entre 0 e 5.")
+                        return
+                    self._data[uid]["gales"] = g
+                    self._states[uid] = "multiplicador"
+                    await event.reply(
+                        "📌 **PASSO 5/9** — **MULTIPLICADOR DE GALE**:\n\n"
+                        "`2.0` → dobra (R$2 → R$4 → R$8)\n"
+                        "`2.5` → 2.5x (R$2 → R$5 → R$12.50)\n"
+                        "`1.5` → suave (R$2 → R$3 → R$4.50)\n\n"
+                        "Digite o valor:"
+                    )
+                except ValueError:
+                    await event.reply("❌ Digite um número inteiro. Ex: `2`")
+
+            elif estado == "multiplicador":
+                try:
+                    m = float(texto.replace(',', '.'))
+                    if not (1.1 <= m <= 5.0):
+                        await event.reply("❌ Valor entre 1.1 e 5.0. Ex: `2.0`")
+                        return
+                    self._data[uid]["multiplicador"] = m
+                    self._states[uid] = "antecipacao"
+                    await event.reply(
+                        "📌 **PASSO 6/9** — **ANTECIPAÇÃO** (segundos):\n"
+                        "`5` = entra 5s antes | `0` = sem antecipação\n"
+                        "_(Recomendado: 3 a 10s)_"
+                    )
+                except ValueError:
+                    await event.reply("❌ Número inválido. Ex: `2.0`")
+
+            elif estado == "antecipacao":
+                try:
+                    a = int(texto)
+                    if not (0 <= a <= 60):
+                        await event.reply("❌ Entre 0 e 60 segundos.")
+                        return
+                    self._data[uid]["antecipacao"] = a
+                    self._states[uid] = "sincronizar"
+                    await event.reply(
+                        "📌 **PASSO 7/9** — **SINCRONIZAR COM VELA?**\n\n"
+                        "🕯️ Aguarda o início exato da próxima vela.",
+                        buttons=[[
+                            Button.inline("✅ Sim (recomendado)", b"cfg_sinc_sim"),
+                            Button.inline("❌ Não", b"cfg_sinc_nao")
+                        ]]
+                    )
+                except ValueError:
+                    await event.reply("❌ Número inteiro. Ex: `5`")
+
+            elif estado == "sincronizar":
+                await event.reply("⬆️ Clique em um dos botões acima.")
+
+            elif estado == "stop_win":
+                try:
+                    sw = float(texto.replace(',', '.'))
+                    if sw < 10:
+                        await event.reply("⚠️ Mínimo R$ 10,00")
+                        return
+                    self._data[uid]["stop_win"] = sw
+                    self._states[uid] = "stop_loss"
+                    await event.reply("📌 **PASSO 8/9** — **STOP LOSS** (R$):\n_(ex: 50.00)_")
+                except ValueError:
+                    await event.reply("❌ Número inválido. Ex: `100.00`")
+
+            elif estado == "stop_loss":
+                try:
+                    sl = float(texto.replace(',', '.'))
+                    if sl < 5:
+                        await event.reply("⚠️ Mínimo R$ 5,00")
+                        return
+                    self._data[uid]["stop_loss"] = sl
+                    self._states[uid] = "tipo_conta"
+                    await event.reply(
+                        "🏦 **Tipo de conta IQ Option:**",
+                        buttons=[[
+                            Button.inline("💰 REAL", b"cfg_conta_real"),
+                            Button.inline("🎯 TREINAMENTO", b"cfg_conta_demo")
+                        ]]
+                    )
+                except ValueError:
+                    await event.reply("❌ Número inválido. Ex: `50.00`")
+
+            elif estado == "tipo_conta":
+                await event.reply("⬆️ Clique em um dos botões acima.")
+
+            elif estado == "canal":
+                try:
+                    canal_id = int(texto)
+                    self._data[uid]["canal_id"] = canal_id
+                    self._states[uid] = None
+                    await self._config_finalizar(event, uid, reply=True)
+                except ValueError:
+                    await event.reply("❌ ID inválido. Ex: `-100123456789`")
+
+            # Edições (simplificadas)
+            elif estado.startswith("edit_"):
+                campo = estado[5:]
+                if campo == "email":
+                    self.config.set("email", texto)
+                elif campo == "senha":
+                    self.config.set("senha", texto)
+                elif campo == "valor":
+                    try:
+                        self.config.set("valor_entrada", float(texto.replace(',', '.')))
+                    except:
+                        await event.reply("❌ Número inválido")
+                        return
+                elif campo == "gales":
+                    try:
+                        self.config.set("gales", int(texto))
+                    except:
+                        await event.reply("❌ Número inválido")
+                        return
+                elif campo == "multiplicador":
+                    try:
+                        self.config.set("multiplicador", float(texto.replace(',', '.')))
+                    except:
+                        await event.reply("❌ Número inválido")
+                        return
+                elif campo == "antecipacao":
+                    try:
+                        self.config.set("antecipacao", int(texto))
+                    except:
+                        await event.reply("❌ Número inválido")
+                        return
+                elif campo == "stop_win":
+                    try:
+                        self.config.set("stop_win", float(texto.replace(',', '.')))
+                    except:
+                        await event.reply("❌ Número inválido")
+                        return
+                elif campo == "stop_loss":
+                    try:
+                        self.config.set("stop_loss", float(texto.replace(',', '.')))
+                    except:
+                        await event.reply("❌ Número inválido")
+                        return
+                elif campo == "canal":
+                    try:
+                        self.config.set("canal_id", int(texto))
+                    except:
+                        await event.reply("❌ ID inválido")
+                        return
+                
+                self._limpar_estado(uid)
+                await event.reply(f"✅ {campo} atualizado!")
+                await self._config_mostrar(event, reply=True)
+
+        except Exception as e:
+            logger.error(f"_h_text: {e}")
+
+    async def _h_callback(self, event):
+        try:
+            uid = event.sender_id
+            data = event.data.decode('utf-8')
+
+            if data == "menu":
+                await self._menu(event, reply=False)
+            elif data == "status":
+                await self._status(event, reply=False)
+            elif data == "config":
+                if not self.config.configurado:
+                    await self._config_iniciar_cb(event)
+                else:
+                    await self._config_mostrar(event, reply=False)
+            elif data == "startauto":
+                if not self.trader.conectado:
+                    await event.edit("⚠️ Conecte à IQ Option primeiro!", buttons=self._bts_voltar())
+                else:
+                    self.config.set("modo_automatico", True)
+                    await event.edit("✅ Modo automático **ATIVADO**!\n📡 Aguardando sinais...", buttons=self._bts_voltar())
+            elif data == "stopauto":
+                self.config.set("modo_automatico", False)
+                await event.edit("🛑 Modo automático **DESATIVADO**.", buttons=self._bts_voltar())
+            elif data == "stats":
+                await self._stats(event, reply=False)
+            elif data == "resetstats":
+                self.stats = StatsManager()
+                await event.edit("✅ Estatísticas resetadas!", buttons=self._bts_voltar())
+            elif data == "conectar":
+                await self._cb_conectar(event)
+            elif data == "help":
+                await self._help(event, reply=False)
+            elif data == "cancelar":
+                await self._cb_cancelar(event, uid)
+
+            # Configuração
+            elif data == "cfg_sinc_sim":
+                self._data[uid]["sincronizar"] = True
+                self._states[uid] = "stop_win"
+                await event.edit("✅ Sincronização **ATIVADA**!\n\n📌 **PASSO 8/9** — **STOP WIN** (R$):")
+            elif data == "cfg_sinc_nao":
+                self._data[uid]["sincronizar"] = False
+                self._states[uid] = "stop_win"
+                await event.edit("ℹ️ Sincronização **desativada**.\n\n📌 **PASSO 8/9** — **STOP WIN** (R$):")
+            elif data == "cfg_conta_real":
+                self._data[uid]["tipo_conta"] = "real"
+                self._states[uid] = "canal"
+                await event.edit("💰 Conta **REAL** selecionada!\n\n📡 **ID do canal de sinais**:\nDigite abaixo:")
+            elif data == "cfg_conta_demo":
+                self._data[uid]["tipo_conta"] = "treinamento"
+                self._states[uid] = "canal"
+                await event.edit("🎯 Conta **TREINAMENTO** selecionada!\n\n📡 **ID do canal de sinais**:\nDigite abaixo:")
+
+            # Edições
+            elif data.startswith("edit_"):
+                campo = data[5:]
+                self._states[uid] = f"edit_{campo}"
+                self._data[uid] = {}
+
+                if campo == "sincronizar":
+                    await event.edit(
+                        "🕯️ **Sincronizar com início de vela?**",
+                        buttons=[[
+                            Button.inline("✅ Sim", b"edt_sinc_sim"),
+                            Button.inline("❌ Não", b"edt_sinc_nao")
+                        ]]
+                    )
+                elif campo == "tipo_conta":
+                    await event.edit(
+                        "🏦 **Tipo de conta:**",
+                        buttons=[[
+                            Button.inline("💰 REAL", b"edt_conta_real"),
+                            Button.inline("🎯 TREINAMENTO", b"edt_conta_demo")
+                        ]]
+                    )
+                else:
+                    label = {
+                        "email": "📧 Digite o NOVO EMAIL:",
+                        "senha": "🔐 Digite a NOVA SENHA:",
+                        "valor": "💵 Digite o NOVO VALOR (R$):",
+                        "gales": "🎯 Quantos GALES? (0–5):",
+                        "multiplicador": "✖️ Novo MULTIPLICADOR:",
+                        "antecipacao": "⏱️ Nova ANTECIPAÇÃO (s):",
+                        "stop_win": "🟢 Novo STOP WIN (R$):",
+                        "stop_loss": "🔴 Novo STOP LOSS (R$):",
+                        "canal": "📡 Novo ID do canal:"
+                    }.get(campo, "Digite o novo valor:")
+                    await event.edit(label, buttons=[[Button.inline("❌ Cancelar", b"cancelar")]])
+
+            elif data == "edt_sinc_sim":
+                self.config.set("sincronizar_vela", True)
+                self._limpar_estado(uid)
+                await event.edit("✅ Sincronização **ATIVADA**!")
+                await self._config_mostrar_msg(uid)
+            elif data == "edt_sinc_nao":
+                self.config.set("sincronizar_vela", False)
+                self._limpar_estado(uid)
+                await event.edit("ℹ️ Sincronização **desativada**.")
+                await self._config_mostrar_msg(uid)
+            elif data == "edt_conta_real":
+                self.config.set("tipo_conta", "real")
+                self._limpar_estado(uid)
+                await event.edit("💰 Conta **REAL** atualizada!")
+                await self._config_mostrar_msg(uid)
+            elif data == "edt_conta_demo":
+                self.config.set("tipo_conta", "treinamento")
+                self._limpar_estado(uid)
+                await event.edit("🎯 Conta **TREINAMENTO** atualizada!")
+                await self._config_mostrar_msg(uid)
+
+            try:
+                await event.answer()
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.error(f"_h_callback: {e}")
+            try:
+                await event.answer("❌ Erro interno", alert=True)
+            except Exception:
+                pass
+
+    # ==================== SINAIS ====================
+
+    async def _h_sinal(self, event):
+        try:
+            if event.message.out:
+                return
+            texto = (event.message.raw_text or "").strip()
+            if not texto:
+                return
+
+            canal_id = self.config.get("canal_id")
+            if not canal_id or event.chat_id != canal_id:
+                return
+            if not self.config.get("modo_automatico", False):
+                return
+            if self.processando:
+                return
+
+            dados = self.parser.parse(texto)
+            if not dados['valido']:
+                return
+
+            await self._executar_sinal(dados)
+
+        except Exception as e:
+            logger.error(f"_h_sinal: {e}")
+
+    async def _executar_sinal(self, dados: dict):
+        self.processando = True
+        antec = self.config.get("antecipacao", 5)
+        sinc = self.config.get("sincronizar_vela", True)
+
+        try:
+            await self.msg(UI.sinal_recebido(dados, antec, sinc))
+
+            horario_sincronizado = False
+            if dados['horario']:
+                try:
+                    nums = re.findall(r'\d+', dados['horario'])
+                    if len(nums) >= 2:
+                        hora, minuto = int(nums[0]), int(nums[1])
+                        agora = datetime.now()
+                        alvo = agora.replace(hour=hora, minute=minuto, second=0, microsecond=0)
+                        if alvo <= agora:
+                            alvo += timedelta(days=1)
+
+                        momento_entrar = alvo - timedelta(seconds=antec)
+                        espera = (momento_entrar - agora).total_seconds()
+
+                        if espera > 0:
+                            ts = momento_entrar.strftime("%H:%M:%S")
+                            await self.msg(
+                                f"⏰ Sinal para: **{dados['horario']}**\n"
+                                f"⏱️ Entrada: **{ts}** ({antec}s antes)\n"
+                                f"⏳ Aguardando **{espera:.0f}s**..."
+                            )
+                            await asyncio.sleep(espera)
+                        else:
+                            await self.msg(f"⚡ Entrada imediata")
+                        horario_sincronizado = True
+                except Exception as ex:
+                    logger.warning(f"Erro ao calcular horário: {ex}")
+
+            resultado = await self.trader.executar(
+                dados['ativo'], dados['direcao'], dados['tempo'],
+                skip_sinc=horario_sincronizado
             )
 
-async def config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 Use /start para reconfigurar completamente.")
+            if not resultado.get('sucesso') and resultado.get('erro'):
+                await self.msg(UI.erro_operacao(resultado['erro']))
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text
-    chat_id = update.effective_chat.id
-    
-    sinal = parse_sinal(text)
-    if not sinal:
-        await update.message.reply_text("ℹ️ Envie 'SINAL' para operar.")
-        return
-    
-    config_manager = ConfigManager(user_id)
-    config = config_manager.get_config()
-    
-    if not config_manager.is_active():
-        await update.message.reply_text("❌ Bot está parado. Use /iniciar.")
-        return
-    
-    operador = context.user_data.get('operador')
-    if not operador or not operador.conectado:
-        await update.message.reply_text("🔄 Reconectando...")
-        operador = IQOperador(config)
-        success, msg = operador.conectar()
-        if not success:
-            await update.message.reply_text(f"❌ {msg}")
-            return
-        context.user_data['operador'] = operador
-    
-    if config['confianca_minima'] > 0 and sinal.get('confianca', 100) < config['confianca_minima']:
-        await update.message.reply_text(f"⚠️ Confiança {sinal.get('confianca')}% < {config['confianca_minima']}%")
-        return
-    
-    if config['score_minimo'] > 0 and sinal.get('score', 100) < config['score_minimo']:
-        await update.message.reply_text(f"⚠️ Score {sinal.get('score')} < {config['score_minimo']}")
-        return
-    
-    await update.message.reply_text(
-        f"📩 SINAL DETECTADO!\n\n"
-        f"💰 Ativo: {sinal['ativo']}\n"
-        f"📈 Direção: {sinal['direcao'].upper()}\n"
-        f"⌛ Expiração: M{sinal['expiracao']}"
-    )
-    
-    operador.operar(sinal, update.message.bot, chat_id)
-
-# ============ MAIN ============
-
-def main():
-    token = os.getenv('TELEGRAM_BOT_TOKEN')
-    
-    if not token:
-        logger.error("❌ TELEGRAM_BOT_TOKEN não configurado!")
-        return
-    
-    application = Application.builder().token(token).build()
-    
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={
-            EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_email)],
-            PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_password)],
-            ACCOUNT_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_account_type)],
-            VALOR_ENTRADA: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_valor_entrada)],
-            MULTIPLICADOR_GALE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_multiplicador_gale)],
-            MAX_GALES: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_max_gales)],
-            STOP_LOSS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_stop_loss)],
-            STOP_WIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_stop_win)],
-            CONFIANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_confiance)],
-            SCORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_score)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-    )
-    
-    application.add_handler(conv_handler)
-    application.add_handler(CommandHandler('config', config))
-    application.add_handler(CommandHandler('iniciar', iniciar))
-    application.add_handler(CommandHandler('status', status))
-    application.add_handler(CommandHandler('stop', stop))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    logger.info("🚀 Bot iniciado!")
-    
-    while True:
-        try:
-            application.run_polling(allowed_updates=Update.ALL_TYPES)
-        except (NetworkError, TimedOut) as e:
-            logger.error(f"Erro de rede: {e}. Reconectando em 10s...")
-            time.sleep(10)
-        except KeyboardInterrupt:
-            logger.info("🛑 Bot interrompido")
-            break
         except Exception as e:
-            logger.error(f"Erro: {e}. Reiniciando em 30s...")
-            time.sleep(30)
+            logger.error(f"_executar_sinal: {e}")
+            await self.msg(f"❌ Erro ao executar sinal: {e}")
+        finally:
+            self.processando = False
+            await self.msg(UI.aguardando_sinais())
+
+    # ==================== MÉTODOS AUXILIARES ====================
+
+    async def _cb_conectar(self, event):
+        try:
+            if self.trader.conectado:
+                await event.edit("✅ Já está conectado!", buttons=self._bts_voltar())
+                return
+
+            email = self.config.get("email")
+            senha = self.config.get("senha")
+            tipo = self.config.get("tipo_conta", "real")
+
+            if not email or not senha:
+                await event.edit("⚠️ Credenciais não configuradas!\nUse /config.", buttons=self._bts_voltar())
+                return
+
+            await event.edit("🔄 Conectando à IQ Option...")
+            sucesso = await self.trader.conectar(email, senha, tipo)
+
+            if sucesso:
+                await event.edit("✅ Conectado com sucesso!", buttons=self._bts_voltar())
+            else:
+                await event.edit("❌ Falha na conexão!", buttons=self._bts_voltar())
+        except Exception as e:
+            logger.error(f"_cb_conectar: {e}")
+            await event.edit(f"❌ Erro: {e}", buttons=self._bts_voltar())
+
+    async def _cb_cancelar(self, event, uid: int):
+        self._limpar_estado(uid)
+        await event.edit("❌ Operação cancelada.", buttons=self._bts_voltar())
+
+    def _limpar_estado(self, uid: int):
+        self._states.pop(uid, None)
+        self._data.pop(uid, None)
+
+    def _bts_menu(self):
+        return [
+            [Button.inline("📊 Status", b"status")],
+            [Button.inline("⚙️ Configurações", b"config")],
+            [Button.inline("▶️ Iniciar Auto", b"startauto"), Button.inline("⏹️ Parar Auto", b"stopauto")],
+            [Button.inline("📈 Estatísticas", b"stats"), Button.inline("🔄 Reset Stats", b"resetstats")],
+            [Button.inline("🔗 Conectar IQ", b"conectar"), Button.inline("❓ Ajuda", b"help")],
+        ]
+
+    def _bts_voltar(self):
+        return [[Button.inline("📋 Menu", b"menu")]]
+
+    def _bts_config(self):
+        return [
+            [Button.inline("✏️ Email", b"edit_email")],
+            [Button.inline("✏️ Senha", b"edit_senha")],
+            [Button.inline("💵 Entrada", b"edit_valor")],
+            [Button.inline("🎯 Gales", b"edit_gales")],
+            [Button.inline("✖️ Multiplicador", b"edit_multiplicador")],
+            [Button.inline("⏱️ Antecipação", b"edit_antecipacao")],
+            [Button.inline("🕯️ Sinc. Vela", b"edit_sincronizar")],
+            [Button.inline("🟢 Stop Win", b"edit_stop_win")],
+            [Button.inline("🔴 Stop Loss", b"edit_stop_loss")],
+            [Button.inline("🏦 Tipo Conta", b"edit_tipo_conta")],
+            [Button.inline("📡 Canal", b"edit_canal")],
+            [Button.inline("📋 Menu", b"menu")],
+        ]
+
+    async def _menu(self, event, reply: bool):
+        if reply:
+            await event.reply(UI.menu(), buttons=self._bts_menu())
+        else:
+            await event.edit(UI.menu(), buttons=self._bts_menu())
+
+    async def _status(self, event, reply: bool):
+        s = self.stats.get_stats()
+        msg = UI.status_sistema(self.trader.conectado, self.trader.saldo, self.trader.tipo_conta, s)
+        bts = [[Button.inline("🔄 Atualizar", b"status"), Button.inline("📋 Menu", b"menu")]]
+        if reply:
+            await event.reply(msg, buttons=bts)
+        else:
+            await event.edit(msg, buttons=bts)
+
+    async def _stats(self, event, reply: bool):
+        s = self.stats.get_stats()
+        td = s.get('total_trades', 0)
+        tw = s.get('total_wins', 0)
+        dd = s.get('daily_trades', 0)
+        dw = s.get('daily_wins', 0)
+        parte_dia = f"📅 **HOJE**\n📈 {dd} trades | 🟢 {dw} | 🔴 {s.get('daily_losses',0)}"
+        if dd:
+            parte_dia += f" | 🎯 {dw/dd*100:.1f}%\n💵 R$ {s.get('daily_profit',0):,.2f}"
+        else:
+            parte_dia += "\n💵 R$ 0,00"
+
+        parte_total = f"🏆 **TOTAL**\n📈 {td} trades | 🟢 {tw} | 🔴 {s.get('total_losses',0)}"
+        if td:
+            parte_total += f" | 🎯 {tw/td*100:.1f}%\n💵 R$ {s.get('total_profit',0):,.2f}"
+        else:
+            parte_total += "\n💵 R$ 0,00"
+
+        msg = f"📊 **ESTATÍSTICAS**\n━━━━━━━━━━━━━━━━━━━━━━━\n\n{parte_dia}\n\n{parte_total}"
+        bts = [[Button.inline("🔄 Atualizar", b"stats"), Button.inline("📋 Menu", b"menu")]]
+        if reply:
+            await event.reply(msg, buttons=bts)
+        else:
+            await event.edit(msg, buttons=bts)
+
+    async def _help(self, event, reply: bool):
+        msg = """
+📚 **COMANDOS**
+━━━━━━━━━━━━━━━━━━━━━━━
+
+/start — Iniciar / configurar
+/config — Ver/alterar configurações
+/menu — Menu principal
+/status — Status do sistema
+/stats — Estatísticas
+/startauto — Ativar robô
+/stopauto — Desativar robô
+/resetstats — Resetar stats
+/help — Esta mensagem
+
+🆕 **v4.0 — NOVIDADES:**
+✅ Nova API Sudip-T/iqoption-api
+✅ WebSocket para dados em tempo real
+✅ Comunicação detalhada no PV
+📊 Resultados formatados com emojis
+🔄 Status em tempo real
+✅ Apuração completa de cada operação
+        """
+        bts = self._bts_voltar()
+        if reply:
+            await event.reply(msg, buttons=bts)
+        else:
+            await event.edit(msg, buttons=bts)
+
+    async def _config_mostrar(self, event, reply: bool):
+        dados = {k: self.config.get(k) for k in self.config.DEFAULTS}
+        msg = UI.configuracao_resumo(dados)
+        if reply:
+            await event.reply(msg, buttons=self._bts_config())
+        else:
+            await event.edit(msg, buttons=self._bts_config())
+
+    async def _config_mostrar_msg(self, uid: int):
+        dados = {k: self.config.get(k) for k in self.config.DEFAULTS}
+        await self.client.send_message(uid, UI.configuracao_resumo(dados), buttons=self._bts_config())
+
+    async def _config_iniciar(self, event):
+        uid = event.sender_id
+        self._data[uid] = {}
+        self._states[uid] = "email"
+        await event.reply(
+            "🔐 **CONFIGURAÇÃO DO QUANTUM BOT v4.0**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📌 **PASSO 1/9 — Email**\n\n"
+            "Digite seu **EMAIL** da IQ Option:"
+        )
+
+    async def _config_iniciar_cb(self, event):
+        uid = event.sender_id
+        self._data[uid] = {}
+        self._states[uid] = "email"
+        await event.edit(
+            "🔐 **CONFIGURAÇÃO DO QUANTUM BOT v4.0**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📌 **PASSO 1/9 — Email**\n\n"
+            "Digite seu **EMAIL** da IQ Option:",
+            buttons=[[Button.inline("❌ Cancelar", b"cancelar")]]
+        )
+
+    async def _config_finalizar(self, event, uid: int, reply: bool):
+        d = self._data.get(uid, {})
+
+        self.config.set("email", d.get("email"))
+        self.config.set("senha", d.get("senha"))
+        self.config.set("valor_entrada", d.get("valor", 5.0))
+        self.config.set("gales", d.get("gales", 2))
+        self.config.set("multiplicador", d.get("multiplicador", 2.0))
+        self.config.set("antecipacao", d.get("antecipacao", 5))
+        self.config.set("sincronizar_vela", d.get("sincronizar", True))
+        self.config.set("stop_win", d.get("stop_win", 100.0))
+        self.config.set("stop_loss", d.get("stop_loss", 50.0))
+        self.config.set("tipo_conta", d.get("tipo_conta", "real"))
+        self.config.set("canal_id", d.get("canal_id"))
+        self.config.set("configurado", True)
+
+        self._limpar_estado(uid)
+
+        if reply:
+            await event.reply("🔄 Conectando à IQ Option...")
+        else:
+            await event.edit("🔄 Conectando à IQ Option...")
+
+        ok = await self.trader.conectar(d.get("email"), d.get("senha"), d.get("tipo_conta", "real"))
+
+        if ok:
+            await self.client.send_message(
+                uid,
+                f"✅ **CONFIGURAÇÃO COMPLETA!**\n\n"
+                f"{UI.configuracao_resumo({k: self.config.get(k) for k in self.config.DEFAULTS})}\n\n"
+                "🚀 Use `/startauto` para ativar o robô!\n"
+                "📡 Aguardando sinais do canal configurado..."
+            )
+        else:
+            await self.client.send_message(
+                uid,
+                "❌ Falha na conexão com a IQ Option.\n"
+                "Verifique email/senha e tente novamente."
+            )
+
+
+# ==================== MAIN ====================
+
+async def main():
+    bot = QuantumBot()
+    try:
+        await bot.run()
+    except KeyboardInterrupt:
+        print("\n🛑 Bot interrompido")
+        logger.info("Bot interrompido")
+    except Exception as e:
+        logger.error(f"Erro fatal: {e}\n{traceback.format_exc()}")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
