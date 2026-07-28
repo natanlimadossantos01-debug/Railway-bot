@@ -7,12 +7,12 @@ import json
 import re
 import time
 import logging
-import asyncio
-import subprocess
+import hashlib
+import requests
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-from telegram.error import RetryAfter, TimedOut, NetworkError
+from telegram.error import NetworkError, TimedOut
 from dotenv import load_dotenv
 
 # Carregar variáveis de ambiente
@@ -25,28 +25,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============ INSTALAÇÃO AUTOMÁTICA DA API ============
-
-def instalar_api():
-    """Instala a API do IQ Option automaticamente"""
-    try:
-        import iqoptionapi
-        logger.info("✅ API IQ Option já instalada")
-        return True
-    except ImportError:
-        logger.info("📦 Instalando IQ Option API...")
-        try:
-            # Tenta instalar a versão mais recente
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "iqoptionapi"])
-            logger.info("✅ API instalada com sucesso!")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Erro ao instalar API: {e}")
-            return False
-
-# Instalar API ao iniciar
-API_INSTALADA = instalar_api()
-
 # Estados da conversa
 (EMAIL, PASSWORD, ACCOUNT_TYPE, VALOR_ENTRADA, MULTIPLICADOR_GALE, 
  MAX_GALES, STOP_LOSS, STOP_WIN, CONFIANCE, SCORE) = range(10)
@@ -56,8 +34,189 @@ CONFIG_DIR = "data/configs"
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
 HISTORICO_MAX = 50
-MAX_RETRIES = 5
+MAX_RETRIES = 3
 RETRY_DELAY = 3
+
+# ============ CLASSE IQ OPTION SIMPLIFICADA ============
+
+class IQOptionAPI:
+    """API simplificada para IQ Option usando apenas requests"""
+    
+    def __init__(self, email, password):
+        self.email = email
+        self.password = password
+        self.session = requests.Session()
+        self.base_url = "https://iqoption.com/api"
+        self.ws_url = "wss://ws.iqoption.com/echo/websocket"
+        self.logged_in = False
+        self.balance = 0
+        self.token = None
+        self.user_id = None
+        
+    def login(self):
+        """Faz login na IQ Option"""
+        try:
+            # Tentar login
+            login_data = {
+                "email": self.email,
+                "password": self.password
+            }
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+            
+            response = self.session.post(
+                "https://auth.iqoption.com/api/v1/login",
+                json=login_data,
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0:
+                    self.logged_in = True
+                    # Pegar token e user_id
+                    self.token = data.get('data', {}).get('token')
+                    self.user_id = data.get('data', {}).get('user_id')
+                    
+                    # Buscar saldo
+                    self._get_balance()
+                    return True, "✅ Login realizado com sucesso!"
+                else:
+                    return False, f"❌ Erro no login: {data.get('msg', 'Erro desconhecido')}"
+            else:
+                return False, f"❌ Erro HTTP: {response.status_code}"
+                
+        except Exception as e:
+            logger.error(f"Erro no login: {e}")
+            return False, f"❌ Erro: {str(e)}"
+    
+    def _get_balance(self):
+        """Busca o saldo da conta"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json"
+            }
+            
+            response = self.session.get(
+                f"{self.base_url}/getbalance",
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                self.balance = data.get('data', {}).get('balance', 0)
+                return self.balance
+            return 0
+        except:
+            return 0
+    
+    def buy(self, amount, asset, direction, expiry):
+        """Executa uma operação"""
+        try:
+            if not self.logged_in:
+                return False, "Não conectado"
+            
+            # Direção: call = 1, put = 2
+            dir_value = 1 if direction.lower() == 'call' else 2
+            
+            # Tempo de expiração em minutos para segundos
+            expiry_seconds = expiry * 60
+            
+            # Preparar dados da operação
+            trade_data = {
+                "asset_id": self._get_asset_id(asset),
+                "amount": float(amount),
+                "direction": dir_value,
+                "expiry": expiry_seconds,
+                "type": 1  # 1 = opção binária
+            }
+            
+            headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json"
+            }
+            
+            # Usar o endpoint de buy
+            response = self.session.post(
+                f"{self.base_url}/buy",
+                json=trade_data,
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0:
+                    order_id = data.get('data', {}).get('order_id')
+                    return True, order_id
+                else:
+                    return False, data.get('msg', 'Erro na operação')
+            else:
+                return False, f"Erro HTTP: {response.status_code}"
+                
+        except Exception as e:
+            logger.error(f"Erro ao comprar: {e}")
+            return False, str(e)
+    
+    def _get_asset_id(self, asset_name):
+        """Converte nome do ativo para ID"""
+        assets = {
+            'EURUSD': 1,
+            'GBPUSD': 2,
+            'USDJPY': 3,
+            'AUDUSD': 4,
+            'USDCAD': 5,
+            'BTCUSD': 6,
+            'ETHUSD': 7,
+            'XRPUSD': 8,
+            # Adicione mais ativos conforme necessário
+        }
+        return assets.get(asset_name.upper(), 1)
+    
+    def check_win(self, order_id):
+        """Verifica resultado de uma operação"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json"
+            }
+            
+            response = self.session.get(
+                f"{self.base_url}/get-result/{order_id}",
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0:
+                    result_data = data.get('data', {})
+                    profit = result_data.get('profit', 0)
+                    status = result_data.get('status', '')
+                    
+                    if profit > 0:
+                        return 'win', profit
+                    elif profit < 0:
+                        return 'loose', abs(profit)
+                    else:
+                        return 'equal', 0
+                else:
+                    return 'erro', 0
+            return 'erro', 0
+        except:
+            return 'erro', 0
+    
+    def get_balance(self):
+        """Retorna o saldo atual"""
+        self._get_balance()
+        return self.balance
 
 class PainelOperacoes:
     def __init__(self):
@@ -157,13 +316,6 @@ class ConfigManager:
         with open(self.config_file, 'w') as f:
             json.dump(self.config, f, indent=2)
     
-    def update(self, key, value):
-        if key in self.config:
-            self.config[key] = value
-            self.save_config()
-            return True
-        return False
-    
     def get_config(self):
         return self.config
     
@@ -184,69 +336,33 @@ class IQOperador:
         self.wins = 0
         self.losses = 0
         self.gales_usados = 0
-        self.ativo = False
         self.conectado = False
 
     def conectar(self):
         try:
-            # Importar a API
-            from iqoptionapi.stable_api import IQ_Option
-            
             if not self.cfg['email'] or not self.cfg['password']:
                 return False, "❌ Email ou senha não configurados!"
             
             logger.info(f"🔄 Conectando IQ Option...")
             
-            self.api = IQ_Option(self.cfg['email'], self.cfg['password'])
-            check, reason = self.api.connect()
+            self.api = IQOptionAPI(self.cfg['email'], self.cfg['password'])
+            success, msg = self.api.login()
             
-            if not check:
-                return False, f"❌ Falha na conexão: {reason}"
+            if not success:
+                return False, msg
             
-            # Mudar para conta correta
-            account_type = 'PRACTICE' if self.cfg['account_type'] == 'PRACTICE' else 'REAL'
-            self.api.change_balance(account_type)
-            
-            balance = self.api.get_balance()
-            self.ativo = True
             self.conectado = True
-            
+            balance = self.api.get_balance()
             logger.info(f"✅ Conectado! Saldo: R$ {balance:.2f}")
             return True, f"✅ Conectado! Saldo: R$ {balance:.2f}"
             
         except Exception as e:
             logger.error(f"❌ Erro na conexão: {e}")
-            self.ativo = False
             self.conectado = False
             return False, f"❌ Erro: {str(e)}"
 
-    def checar_resultado(self, id_op):
-        try:
-            if not self.api:
-                return "erro", 0.0
-            
-            resultado = self.api.check_win_v3(id_op)
-            
-            if isinstance(resultado, tuple):
-                status, lucro = resultado
-                return str(status).lower(), float(lucro)
-            elif isinstance(resultado, (int, float)):
-                lucro = float(resultado)
-                if lucro > 0:
-                    return "win", lucro
-                elif lucro < 0:
-                    return "loose", abs(lucro)
-                else:
-                    return "equal", 0.0
-            else:
-                return str(resultado).lower(), 0.0
-                
-        except Exception as e:
-            logger.error(f"❌ Erro ao checar resultado: {e}")
-            return "erro", 0.0
-
     def operar(self, sinal, bot, chat_id):
-        if not self.conectado or not self.ativo:
+        if not self.conectado:
             return "❌ Bot não conectado. Use /iniciar para reconectar."
         
         cfg = self.cfg
@@ -263,7 +379,6 @@ class IQOperador:
         if cfg["stop_win"] > 0 and self.lucro_dia >= cfg["stop_win"]:
             return f"🏆 Stop Win atingido! Lucro: R$ {self.lucro_dia:.2f}"
 
-        # Enviar mensagem de início
         bot.send_message(chat_id, f"🎯 {ativo} | {direcao.upper()} | M{exp} | R$ {valor:.2f}")
 
         tentativa = 0
@@ -286,16 +401,15 @@ class IQOperador:
                 })
 
             try:
-                # Executar trade
-                check, id_op = self.api.buy(val_atual, ativo, direcao, exp)
+                success, order_id = self.api.buy(val_atual, ativo, direcao, exp)
                 
-                if not check:
-                    return f"❌ Ordem rejeitada: {id_op}"
+                if not success:
+                    return f"❌ Ordem rejeitada: {order_id}"
 
                 bot.send_message(chat_id, f"⏳ Aguardando resultado (M{exp})...")
                 time.sleep(exp * 60 + 5)
                 
-                status, lucro = self.checar_resultado(id_op)
+                status, lucro = self.api.check_win(order_id)
                 self.operacoes += 1
 
                 if status == "win":
@@ -348,14 +462,6 @@ class IQOperador:
                 error_msg = f"❌ Erro: {str(e)}"
                 logger.error(error_msg)
                 bot.send_message(chat_id, error_msg)
-                
-                # Tentar reconectar
-                if "connection" in str(e).lower() or "timeout" in str(e).lower():
-                    bot.send_message(chat_id, "🔄 Tentando reconectar...")
-                    success, msg = self.conectar()
-                    if success:
-                        bot.send_message(chat_id, "✅ Reconectado!")
-                        continue
                 break
 
         if self.operacoes > 0:
@@ -405,7 +511,6 @@ def parse_sinal(texto):
 # ============ HANDLERS DO TELEGRAM ============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia a configuração do bot"""
     user_id = update.effective_user.id
     config_manager = ConfigManager(user_id)
     config = config_manager.get_config()
@@ -630,7 +735,6 @@ async def get_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SCORE
 
 async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia o bot conectando à IQ Option"""
     user_id = update.effective_user.id
     config_manager = ConfigManager(user_id)
     config = config_manager.get_config()
@@ -638,21 +742,6 @@ async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not config['email'] or not config['password']:
         await update.message.reply_text("❌ Configure o bot primeiro com /start")
         return
-    
-    # Verificar se a API está instalada
-    if not API_INSTALADA:
-        await update.message.reply_text(
-            "⚠️ API do IQ Option não está instalada!\n"
-            "Tentando instalar automaticamente..."
-        )
-        if instalar_api():
-            await update.message.reply_text("✅ API instalada! Tentando conectar...")
-        else:
-            await update.message.reply_text(
-                "❌ Falha ao instalar API.\n"
-                "Execute manualmente: pip install iqoptionapi"
-            )
-            return
     
     # Conectar
     operador = IQOperador(config)
@@ -703,7 +792,6 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if 'operador' in context.user_data:
         operador = context.user_data['operador']
-        operador.ativo = False
         operador.conectado = False
     
     await update.message.reply_text("⏹️ Bot parado com sucesso!")
@@ -722,11 +810,9 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 async def config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reconfigura o bot"""
     await update.message.reply_text("🔄 Use /start para reconfigurar completamente.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processa mensagens do usuário"""
     user_id = update.effective_user.id
     text = update.message.text
     chat_id = update.effective_chat.id
@@ -777,17 +863,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ MAIN ============
 
 def main():
-    """Função principal"""
     token = os.getenv('TELEGRAM_BOT_TOKEN')
     
     if not token:
         logger.error("❌ TELEGRAM_BOT_TOKEN não configurado!")
         return
     
-    # Criar aplicação
     application = Application.builder().token(token).build()
     
-    # Conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -805,7 +888,6 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)],
     )
     
-    # Adicionar handlers
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler('config', config))
     application.add_handler(CommandHandler('iniciar', iniciar))
@@ -813,7 +895,6 @@ def main():
     application.add_handler(CommandHandler('stop', stop))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Iniciar bot com reconexão automática
     logger.info("🚀 Bot iniciado!")
     
     while True:
