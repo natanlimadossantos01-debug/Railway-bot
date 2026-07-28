@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import asyncio
-import json
 import os
-import re
 import sys
+import json
+import re
 import time
 import logging
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from dotenv import load_dotenv
-import requests
 
-# Carregar variáveis de ambiente (apenas para Railway)
+# Carregar variáveis de ambiente
 load_dotenv()
 
+# Configurar logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -25,9 +24,12 @@ logger = logging.getLogger(__name__)
 
 # Estados da conversa
 (EMAIL, PASSWORD, ACCOUNT_TYPE, VALOR_ENTRADA, MULTIPLICADOR_GALE, 
- MAX_GALES, STOP_LOSS, STOP_WIN, CONFIANCE, SCORE, CONFIRM) = range(11)
+ MAX_GALES, STOP_LOSS, STOP_WIN, CONFIANCE, SCORE) = range(10)
 
-CONFIG_FILE = "user_config.json"
+# Configurações
+CONFIG_DIR = "data/configs"
+os.makedirs(CONFIG_DIR, exist_ok=True)
+
 HISTORICO_MAX = 50
 
 class PainelOperacoes:
@@ -65,7 +67,7 @@ class PainelOperacoes:
         taxa = (s["wins"] / s["total"] * 100) if s["total"] > 0 else 0
         
         status = f"""
-📊 **ESTATÍSTICAS**
+📊 *ESTATÍSTICAS*
 ━━━━━━━━━━━━━━━━━━
 📈 Total: {s['total']}
 ✅ Wins: {s['wins']}
@@ -76,7 +78,7 @@ class PainelOperacoes:
 📈 Sequência: {self.formatar_seq(s['sequencia'])}
 🏆 Melhor: {s['melhor_seq']} | ❄️ Pior: {s['pior_seq']}
 ━━━━━━━━━━━━━━━━━━
-📋 **ÚLTIMAS 5 OPERAÇÕES**
+📋 *ÚLTIMAS 5 OPERAÇÕES*
 """
         for op in self.operacoes[:5]:
             status += f"\n• {op['hora']} {op['ativo']} "
@@ -97,13 +99,16 @@ class PainelOperacoes:
 class ConfigManager:
     def __init__(self, user_id):
         self.user_id = str(user_id)
-        self.config_file = f"config_{self.user_id}.json"
+        self.config_file = os.path.join(CONFIG_DIR, f'config_{self.user_id}.json')
         self.config = self.load_config()
     
     def load_config(self):
         if os.path.exists(self.config_file):
-            with open(self.config_file, 'r') as f:
-                return json.load(f)
+            try:
+                with open(self.config_file, 'r') as f:
+                    return json.load(f)
+            except:
+                return self.get_default_config()
         return self.get_default_config()
     
     def get_default_config(self):
@@ -119,9 +124,6 @@ class ConfigManager:
                 "stop_win": 0,
                 "confianca_minima": 0,
                 "score_minimo": 0
-            },
-            "telegram": {
-                "user_id": self.user_id
             },
             "ativo": False
         }
@@ -200,7 +202,7 @@ class IQOperador:
             logger.error(f"Erro ao checar resultado: {e}")
             return "erro", 0.0
 
-    def operar(self, sinal, bot, chat_id, user_id):
+    def operar(self, sinal, bot, chat_id):
         if not self.ativo:
             return "❌ Bot não está ativo. Use /start para configurar."
         
@@ -218,8 +220,7 @@ class IQOperador:
         if cfg["stop_win"] > 0 and self.lucro_dia >= cfg["stop_win"]:
             return f"🏆 Stop Win atingido! Lucro: R$ {self.lucro_dia:.2f}"
 
-        msg = f"🎯 {ativo} | {direcao.upper()} | M{exp} | R$ {valor:.2f}"
-        bot.send_message(chat_id, msg)
+        bot.send_message(chat_id, f"🎯 {ativo} | {direcao.upper()} | M{exp} | R$ {valor:.2f}")
 
         tentativa = 0
         resultado_final = ""
@@ -256,6 +257,7 @@ class IQOperador:
                 if not success:
                     return f"❌ Ordem rejeitada: {order_id}"
 
+                bot.send_message(chat_id, f"⏳ Aguardando resultado (M{exp})...")
                 time.sleep(exp * 60 + 5)
                 
                 status, lucro = self.checar_resultado(order_id, exp)
@@ -314,7 +316,7 @@ class IQOperador:
                 break
 
         if self.operacoes > 0:
-            taxa = (self.wins / self.operacoes * 100)
+            taxa = (self.wins / self.operacoes * 100) if self.operacoes > 0 else 0
             summary = f"📊 {self.operacoes} ops | {self.wins}W/{self.losses}L | {taxa:.0f}% | R$ {self.lucro_dia:.2f}"
             bot.send_message(chat_id, summary)
         
@@ -362,40 +364,48 @@ def parse_sinal(texto):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Inicia a configuração do bot"""
     user_id = update.effective_user.id
-    
-    # Verificar se já tem configuração
     config_manager = ConfigManager(user_id)
     config = config_manager.get_iq_config()
     
     if config['email'] and config['password']:
-        keyboard = [
-            [InlineKeyboardButton("🚀 Iniciar Bot", callback_data="start_bot")],
-            [InlineKeyboardButton("⚙️ Reconfigurar", callback_data="reconfig")],
-            [InlineKeyboardButton("📊 Status", callback_data="status")],
-            [InlineKeyboardButton("⏹️ Parar Bot", callback_data="stop_bot")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
         await update.message.reply_text(
-            f"🤖 **Quantum Bot - Configuração Existente**\n\n"
+            f"🤖 *Quantum Bot - Configuração Existente*\n\n"
             f"📧 Email: {config['email']}\n"
             f"💳 Conta: {config['account_type']}\n"
-            f"💰 Entrada: R$ {config['valor_entrada']}\n"
-            f"🔄 Gale: {config['multiplicador_gale']}x (max {config['max_gales']})\n\n"
-            f"Escolha uma opção:",
-            reply_markup=reply_markup,
+            f"💰 Entrada: R$ {config['valor_entrada']:.2f}\n"
+            f"🔄 Gale: {config['multiplicador_gale']}x (max {config['max_gales']})\n"
+            f"🛑 Stop Loss: R$ {config['stop_loss']:.2f}\n"
+            f"🏆 Stop Win: R$ {config['stop_win']:.2f}\n"
+            f"🔍 Confiança: {config['confianca_minima']}%\n"
+            f"🛡️ Score: {config['score_minimo']}/100\n\n"
+            f"📌 *Comandos disponíveis:*\n"
+            f"/start - Mostrar esta mensagem\n"
+            f"/config - Reconfigurar bot\n"
+            f"/status - Ver estatísticas\n"
+            f"/stop - Parar bot\n"
+            f"/iniciar - Iniciar bot\n\n"
+            f"ℹ️ Envie mensagens com 'SINAL' para executar operações",
             parse_mode='Markdown'
         )
         return ConversationHandler.END
     
-    # Iniciar configuração sequencial
     await update.message.reply_text(
-        "🤖 **Bem-vindo ao Quantum Bot!**\n\n"
+        "🤖 *Bem-vindo ao Quantum Bot!*\n\n"
         "Vamos configurar seu bot passo a passo.\n"
         "Digite /cancel a qualquer momento para cancelar.\n\n"
-        "📧 **Digite seu email da IQ Option:**"
+        "📧 *Digite seu email da IQ Option:*",
+        parse_mode='Markdown'
     )
     return EMAIL
+
+async def config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reconfigura o bot"""
+    await update.message.reply_text(
+        "🔄 *Reconfiguração*\n\n"
+        "Digite /start para reiniciar a configuração.",
+        parse_mode='Markdown'
+    )
+    return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancela a configuração"""
@@ -405,44 +415,54 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Recebe o email"""
     email = update.message.text.strip()
-    context.user_data['email'] = email
+    if '@' not in email:
+        await update.message.reply_text("⚠️ Email inválido. Digite um email válido:")
+        return EMAIL
     
+    context.user_data['email'] = email
     await update.message.reply_text(
         f"📧 Email: {email}\n\n"
-        f"🔑 **Digite sua senha da IQ Option:**"
+        f"🔑 *Digite sua senha da IQ Option:*",
+        parse_mode='Markdown'
     )
     return PASSWORD
 
 async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Recebe a senha"""
     password = update.message.text.strip()
-    context.user_data['password'] = password
+    if len(password) < 4:
+        await update.message.reply_text("⚠️ Senha muito curta. Digite novamente:")
+        return PASSWORD
     
-    keyboard = [
-        [InlineKeyboardButton("💰 Demo", callback_data="PRACTICE")],
-        [InlineKeyboardButton("💵 Real", callback_data="REAL")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    context.user_data['password'] = password
     
     await update.message.reply_text(
         f"🔑 Senha: {'*' * len(password)}\n\n"
-        f"💳 **Tipo de conta:**",
-        reply_markup=reply_markup
+        f"💳 *Tipo de conta:*\n"
+        f"Digite '1' para DEMO ou '2' para REAL",
+        parse_mode='Markdown'
     )
     return ACCOUNT_TYPE
 
 async def get_account_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Recebe o tipo de conta"""
-    query = update.callback_query
-    await query.answer()
+    choice = update.message.text.strip()
     
-    account_type = query.data
+    if choice == '1':
+        account_type = 'PRACTICE'
+    elif choice == '2':
+        account_type = 'REAL'
+    else:
+        await update.message.reply_text("⚠️ Digite '1' para DEMO ou '2' para REAL:")
+        return ACCOUNT_TYPE
+    
     context.user_data['account_type'] = account_type
     
-    await query.edit_message_text(
+    await update.message.reply_text(
         f"💳 Conta: {account_type}\n\n"
-        f"💰 **Valor de entrada (mínimo R$ 1.00):**\n"
-        f"Exemplo: 5.00"
+        f"💰 *Valor de entrada (mínimo R$ 1.00):*\n"
+        f"Digite o valor (exemplo: 5.00)",
+        parse_mode='Markdown'
     )
     return VALOR_ENTRADA
 
@@ -458,8 +478,9 @@ async def get_valor_entrada(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(
             f"💰 Entrada: R$ {valor:.2f}\n\n"
-            f"🔄 **Multiplicador do Gale:**\n"
-            f"Exemplo: 2.0 (dobra o valor)"
+            f"🔄 *Multiplicador do Gale:*\n"
+            f"Digite o multiplicador (exemplo: 2.0)",
+            parse_mode='Markdown'
         )
         return MULTIPLICADOR_GALE
     except ValueError:
@@ -478,8 +499,9 @@ async def get_multiplicador_gale(update: Update, context: ContextTypes.DEFAULT_T
         
         await update.message.reply_text(
             f"🔄 Multiplicador: {multi}x\n\n"
-            f"📊 **Número máximo de Gales:**\n"
-            f"Exemplo: 1 (apenas 1 gale)"
+            f"📊 *Número máximo de Gales:*\n"
+            f"Digite o número (exemplo: 1)",
+            parse_mode='Markdown'
         )
         return MAX_GALES
     except ValueError:
@@ -498,8 +520,9 @@ async def get_max_gales(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(
             f"📊 Max Gales: {max_gales}\n\n"
-            f"🛑 **Stop Loss (0 para desativar):**\n"
-            f"Exemplo: 50.00 (para R$ 50,00)"
+            f"🛑 *Stop Loss (0 para desativar):*\n"
+            f"Digite o valor (exemplo: 50.00)",
+            parse_mode='Markdown'
         )
         return STOP_LOSS
     except ValueError:
@@ -518,8 +541,9 @@ async def get_stop_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(
             f"🛑 Stop Loss: R$ {stop_loss:.2f}\n\n"
-            f"🏆 **Stop Win (0 para desativar):**\n"
-            f"Exemplo: 100.00 (para R$ 100,00)"
+            f"🏆 *Stop Win (0 para desativar):*\n"
+            f"Digite o valor (exemplo: 100.00)",
+            parse_mode='Markdown'
         )
         return STOP_WIN
     except ValueError:
@@ -538,8 +562,9 @@ async def get_stop_win(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(
             f"🏆 Stop Win: R$ {stop_win:.2f}\n\n"
-            f"🔍 **Confiança mínima (0 para ignorar):**\n"
-            f"Exemplo: 70 (70%)"
+            f"🔍 *Confiança mínima (0 para ignorar):*\n"
+            f"Digite o valor (exemplo: 70)",
+            parse_mode='Markdown'
         )
         return CONFIANCE
     except ValueError:
@@ -558,8 +583,9 @@ async def get_confiance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(
             f"🔍 Confiança mínima: {confiance}%\n\n"
-            f"🛡️ **Score mínimo (0 para ignorar):**\n"
-            f"Exemplo: 80 (80/100)"
+            f"🛡️ *Score mínimo (0 para ignorar):*\n"
+            f"Digite o valor (exemplo: 80)",
+            parse_mode='Markdown'
         )
         return SCORE
     except ValueError:
@@ -580,43 +606,43 @@ async def get_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         config_manager = ConfigManager(user_id)
         
-        # Atualizar todas as configurações
-        for key, value in context.user_data.items():
-            if key in ['email', 'password', 'account_type']:
-                config_manager.config['iqoption'][key] = value
-            else:
-                config_manager.update(key, value)
-        
+        # Atualizar configurações
+        config = config_manager.get_iq_config()
+        config['email'] = context.user_data.get('email', '')
+        config['password'] = context.user_data.get('password', '')
+        config['account_type'] = context.user_data.get('account_type', 'PRACTICE')
+        config['valor_entrada'] = context.user_data.get('valor_entrada', 5.0)
+        config['multiplicador_gale'] = context.user_data.get('multiplicador_gale', 2.0)
+        config['max_gales'] = context.user_data.get('max_gales', 1)
+        config['stop_loss'] = context.user_data.get('stop_loss', 0)
+        config['stop_win'] = context.user_data.get('stop_win', 0)
+        config['confianca_minima'] = context.user_data.get('confianca_minima', 0)
+        config['score_minimo'] = context.user_data.get('score_minimo', 0)
         config_manager.save_config()
         
         # Mostrar resumo
-        config = config_manager.get_iq_config()
-        
         summary = f"""
-✅ **CONFIGURAÇÃO CONCLUÍDA!**
+✅ *CONFIGURAÇÃO CONCLUÍDA!*
 
-📧 **Email:** {config['email']}
-💳 **Conta:** {config['account_type']}
-💰 **Entrada:** R$ {config['valor_entrada']:.2f}
-🔄 **Gale:** {config['multiplicador_gale']}x (max {config['max_gales']})
-🛑 **Stop Loss:** R$ {config['stop_loss']:.2f}
-🏆 **Stop Win:** R$ {config['stop_win']:.2f}
-🔍 **Confiança:** {config['confianca_minima']}%
-🛡️ **Score:** {config['score_minimo']}/100
+📧 *Email:* {config['email']}
+💳 *Conta:* {config['account_type']}
+💰 *Entrada:* R$ {config['valor_entrada']:.2f}
+🔄 *Gale:* {config['multiplicador_gale']}x (max {config['max_gales']})
+🛑 *Stop Loss:* R$ {config['stop_loss']:.2f}
+🏆 *Stop Win:* R$ {config['stop_win']:.2f}
+🔍 *Confiança:* {config['confianca_minima']}%
+🛡️ *Score:* {config['score_minimo']}/100
 
-Digite /start para iniciar o bot!
+Digite /iniciar para conectar e iniciar o bot!
 """
         await update.message.reply_text(summary, parse_mode='Markdown')
-        
-        # Iniciar bot automaticamente
-        await iniciar_bot(update, context)
         
         return ConversationHandler.END
     except ValueError:
         await update.message.reply_text("❌ Digite um número inteiro válido.")
         return SCORE
 
-async def iniciar_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Inicia o bot"""
     user_id = update.effective_user.id
     config_manager = ConfigManager(user_id)
@@ -639,12 +665,13 @@ async def iniciar_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config_manager.set_active(True)
     
     await update.message.reply_text(
-        f"🚀 **BOT INICIADO!**\n\n"
+        f"🚀 *BOT INICIADO!*\n\n"
         f"✅ IQ Option Conectado\n"
         f"📧 {config['email']}\n"
         f"💰 Saldo: R$ {operador.api.get_balance():.2f}\n\n"
         f"📌 Envie mensagens com 'SINAL' para executar operações\n"
-        f"🔧 Comandos: /status, /config, /stop"
+        f"🔧 Comandos: /status, /stop",
+        parse_mode='Markdown'
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -657,21 +684,21 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if operador and operador.ativo:
         status_text = f"""
-🤖 **STATUS DO BOT**
+🤖 *STATUS DO BOT*
 
-📧 **Email:** {config['email']}
-💳 **Conta:** {config['account_type']}
-💰 **Entrada:** R$ {config['valor_entrada']:.2f}
-🔄 **Gale:** {config['multiplicador_gale']}x
-🛑 **Stop:** L: R$ {config['stop_loss']:.2f} | W: R$ {config['stop_win']:.2f}
+📧 *Email:* {config['email']}
+💳 *Conta:* {config['account_type']}
+💰 *Entrada:* R$ {config['valor_entrada']:.2f}
+🔄 *Gale:* {config['multiplicador_gale']}x
+🛑 *Stop:* L: R$ {config['stop_loss']:.2f} | W: R$ {config['stop_win']:.2f}
 
 {operador.painel.get_status()}
         """
         await update.message.reply_text(status_text, parse_mode='Markdown')
     else:
-        await update.message.reply_text("❌ Bot não está ativo. Use /start para configurar.")
+        await update.message.reply_text("❌ Bot não está ativo. Use /iniciar para iniciar.")
 
-async def stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Para o bot"""
     user_id = update.effective_user.id
     config_manager = ConfigManager(user_id)
@@ -686,20 +713,21 @@ async def stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
     
-    await update.message.reply_text("⏹️ **Bot parado com sucesso!**")
+    await update.message.reply_text("⏹️ *Bot parado com sucesso!*", parse_mode='Markdown')
     
     # Mostrar resumo
     if 'operador' in context.user_data:
         operador = context.user_data['operador']
         if operador.operacoes > 0:
-            taxa = (operador.wins / operador.operacoes * 100)
+            taxa = (operador.wins / operador.operacoes * 100) if operador.operacoes > 0 else 0
             await update.message.reply_text(
-                f"📊 **RESUMO FINAL**\n\n"
+                f"📊 *RESUMO FINAL*\n\n"
                 f"📈 Total: {operador.operacoes}\n"
                 f"✅ Wins: {operador.wins}\n"
                 f"❌ Loss: {operador.losses}\n"
                 f"📊 Taxa: {taxa:.1f}%\n"
-                f"💰 Lucro: R$ {operador.lucro_dia:.2f}"
+                f"💰 Lucro: R$ {operador.lucro_dia:.2f}",
+                parse_mode='Markdown'
             )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -719,7 +747,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = config_manager.get_iq_config()
     
     if not config_manager.is_active():
-        await update.message.reply_text("❌ Bot está parado. Use /start para iniciar.")
+        await update.message.reply_text("❌ Bot está parado. Use /iniciar para iniciar.")
         return
     
     # Verificar se tem operador
@@ -743,20 +771,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Executar operação
-    await update.message.reply_text(f"📩 **SINAL DETECTADO!**\n\n💰 Ativo: {sinal['ativo']}\n📈 Direção: {sinal['direcao'].upper()}\n⌛ Expiração: M{sinal['expiracao']}")
+    await update.message.reply_text(
+        f"📩 *SINAL DETECTADO!*\n\n"
+        f"💰 Ativo: {sinal['ativo']}\n"
+        f"📈 Direção: {sinal['direcao'].upper()}\n"
+        f"⌛ Expiração: M{sinal['expiracao']}",
+        parse_mode='Markdown'
+    )
     
-    resultado = operador.operar(sinal, update.message.bot, chat_id, user_id)
+    operador.operar(sinal, update.message.bot, chat_id)
 
 # ============ MAIN ============
 
 def main():
     """Função principal"""
-    # Pegar token das variáveis de ambiente
     token = os.getenv('TELEGRAM_BOT_TOKEN')
     
     if not token:
         logger.error("❌ TELEGRAM_BOT_TOKEN não configurado!")
-        logger.info("Configure as variáveis de ambiente no Railway ou crie um arquivo .env")
+        logger.info("Configure a variável de ambiente TELEGRAM_BOT_TOKEN")
         return
     
     # Criar aplicação
@@ -782,11 +815,10 @@ def main():
     
     # Adicionar handlers
     application.add_handler(conv_handler)
+    application.add_handler(CommandHandler('config', config))
+    application.add_handler(CommandHandler('iniciar', iniciar))
     application.add_handler(CommandHandler('status', status))
-    application.add_handler(CommandHandler('stop', stop_bot))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Callback para botões
+    application.add_handler(CommandHandler('stop', stop))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Iniciar bot
