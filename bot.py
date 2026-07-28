@@ -32,6 +32,16 @@ os.makedirs(CONFIG_DIR, exist_ok=True)
 
 HISTORICO_MAX = 50
 
+# ============ FUNÇÃO DE ESCAPE ============
+
+def escape_markdown(text):
+    """Escapa caracteres especiais do Markdown v2"""
+    if not text:
+        return ""
+    # Caracteres que precisam ser escapados no Markdown v2
+    escape_chars = r'\_*[]()~`>#+-=|{}.!'
+    return re.sub(r'([{}])'.format(re.escape(escape_chars)), r'\\\1', str(text))
+
 class PainelOperacoes:
     def __init__(self):
         self.operacoes = []
@@ -370,7 +380,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if config['email'] and config['password']:
         await update.message.reply_text(
             f"🤖 *Quantum Bot - Configuração Existente*\n\n"
-            f"📧 Email: {config['email']}\n"
+            f"📧 Email: {escape_markdown(config['email'])}\n"
             f"💳 Conta: {config['account_type']}\n"
             f"💰 Entrada: R$ {config['valor_entrada']:.2f}\n"
             f"🔄 Gale: {config['multiplicador_gale']}x (max {config['max_gales']})\n"
@@ -421,7 +431,7 @@ async def get_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     context.user_data['email'] = email
     await update.message.reply_text(
-        f"📧 Email: {email}\n\n"
+        f"📧 Email: {escape_markdown(email)}\n\n"
         f"🔑 *Digite sua senha da IQ Option:*",
         parse_mode='Markdown'
     )
@@ -624,7 +634,7 @@ async def get_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
         summary = f"""
 ✅ *CONFIGURAÇÃO CONCLUÍDA!*
 
-📧 *Email:* {config['email']}
+📧 *Email:* {escape_markdown(config['email'])}
 💳 *Conta:* {config['account_type']}
 💰 *Entrada:* R$ {config['valor_entrada']:.2f}
 🔄 *Gale:* {config['multiplicador_gale']}x (max {config['max_gales']})
@@ -657,7 +667,7 @@ async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success, msg = operador.conectar()
     
     if not success:
-        await update.message.reply_text(f"❌ Erro: {msg}\nUse /start para reconfigurar.")
+        await update.message.reply_text(f"❌ {escape_markdown(msg)}\nUse /start para reconfigurar.")
         return
     
     # Salvar operador no contexto
@@ -667,7 +677,7 @@ async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🚀 *BOT INICIADO!*\n\n"
         f"✅ IQ Option Conectado\n"
-        f"📧 {config['email']}\n"
+        f"📧 {escape_markdown(config['email'])}\n"
         f"💰 Saldo: R$ {operador.api.get_balance():.2f}\n\n"
         f"📌 Envie mensagens com 'SINAL' para executar operações\n"
         f"🔧 Comandos: /status, /stop",
@@ -686,7 +696,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_text = f"""
 🤖 *STATUS DO BOT*
 
-📧 *Email:* {config['email']}
+📧 *Email:* {escape_markdown(config['email'])}
 💳 *Conta:* {config['account_type']}
 💰 *Entrada:* R$ {config['valor_entrada']:.2f}
 🔄 *Gale:* {config['multiplicador_gale']}x
@@ -731,51 +741,104 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processa mensagens do usuário"""
+    """Processa mensagens do usuário - COM AVISO DE SINAL"""
     user_id = update.effective_user.id
     text = update.message.text
     chat_id = update.effective_chat.id
+    username = update.effective_user.username or "Usuário"
+    
+    # 🔔 AVISO: Mensagem recebida (com escape)
+    await update.message.reply_text(
+        f"📨 *MENSAGEM RECEBIDA!*\n\n"
+        f"👤 De: @{escape_markdown(username)}\n"
+        f"📝 Conteúdo: {escape_markdown(text[:100])}{'...' if len(text) > 100 else ''}\n"
+        f"⏰ Horário: {datetime.now().strftime('%H:%M:%S')}",
+        parse_mode='Markdown'
+    )
     
     # Verificar se é sinal
     sinal = parse_sinal(text)
     if not sinal:
-        await update.message.reply_text("ℹ️ Mensagem recebida. Aguardando sinais com 'SINAL'...")
+        await update.message.reply_text(
+            "ℹ️ *Não é um sinal válido.*\n\n"
+            "Para enviar um sinal, inclua a palavra 'SINAL' e as informações:\n"
+            "• Ativo\n"
+            "• Direção (CALL/PUT)\n"
+            "• Expiração (M1, M5, etc)\n\n"
+            "Exemplo:\n"
+            "SINAL\n"
+            "Ativo: EURUSD\n"
+            "Direção: CALL\n"
+            "Expiração: M1",
+            parse_mode='Markdown'
+        )
         return
+    
+    # 🔔 AVISO: Sinal detectado!
+    await update.message.reply_text(
+        f"🔔 *SINAL DETECTADO!* 🔔\n\n"
+        f"📊 *Detalhes do Sinal:*\n"
+        f"💰 Ativo: {escape_markdown(str(sinal.get('ativo', 'N/A')))}\n"
+        f"📈 Direção: {escape_markdown(str(sinal.get('direcao', 'N/A').upper()))}\n"
+        f"⌛ Expiração: M{sinal.get('expiracao', 1)}\n"
+        f"📊 Confiança: {sinal.get('confianca', 'N/A')}%\n"
+        f"🛡️ Score IA: {sinal.get('score', 'N/A')}/100\n"
+        f"🔄 Gales: {sinal.get('gales', 0)}\n\n"
+        f"⏳ *Processando sinal...*",
+        parse_mode='Markdown'
+    )
     
     # Processar sinal
     config_manager = ConfigManager(user_id)
     config = config_manager.get_iq_config()
     
     if not config_manager.is_active():
-        await update.message.reply_text("❌ Bot está parado. Use /iniciar para iniciar.")
+        await update.message.reply_text(
+            "❌ *Bot está parado.*\n\n"
+            "Use /iniciar para ativar o bot.",
+            parse_mode='Markdown'
+        )
         return
     
     # Verificar se tem operador
     operador = context.user_data.get('operador')
     if not operador or not operador.ativo:
-        await update.message.reply_text("🔄 Reconectando IQ Option...")
+        await update.message.reply_text(
+            "🔄 *Reconectando IQ Option...*\n"
+            "Aguarde um momento.",
+            parse_mode='Markdown'
+        )
         operador = IQOperador(config)
         success, msg = operador.conectar()
         if not success:
-            await update.message.reply_text(f"❌ {msg}")
+            await update.message.reply_text(f"❌ {escape_markdown(msg)}")
             return
         context.user_data['operador'] = operador
     
     # Verificar filtros
     if config['confianca_minima'] > 0 and sinal.get('confianca', 100) < config['confianca_minima']:
-        await update.message.reply_text(f"⚠️ Confiança {sinal.get('confianca')}% < {config['confianca_minima']}% (ignorado)")
+        await update.message.reply_text(
+            f"⚠️ *SINAL REJEITADO!*\n\n"
+            f"Confiança {sinal.get('confianca')}% < {config['confianca_minima']}%\n"
+            f"✅ Filtro de confiança ativado.",
+            parse_mode='Markdown'
+        )
         return
     
     if config['score_minimo'] > 0 and sinal.get('score', 100) < config['score_minimo']:
-        await update.message.reply_text(f"⚠️ Score {sinal.get('score')} < {config['score_minimo']} (ignorado)")
+        await update.message.reply_text(
+            f"⚠️ *SINAL REJEITADO!*\n\n"
+            f"Score {sinal.get('score')} < {config['score_minimo']}\n"
+            f"✅ Filtro de score ativado.",
+            parse_mode='Markdown'
+        )
         return
     
-    # Executar operação
+    # ✅ Aprovado! Executar operação
     await update.message.reply_text(
-        f"📩 *SINAL DETECTADO!*\n\n"
-        f"💰 Ativo: {sinal['ativo']}\n"
-        f"📈 Direção: {sinal['direcao'].upper()}\n"
-        f"⌛ Expiração: M{sinal['expiracao']}",
+        f"✅ *SINAL APROVADO!*\n\n"
+        f"🚀 Executando operação...\n"
+        f"💰 Valor: R$ {config['valor_entrada']:.2f}",
         parse_mode='Markdown'
     )
     
