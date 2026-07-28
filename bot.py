@@ -8,6 +8,9 @@ import re
 import time
 import logging
 import hashlib
+import hmac
+import random
+import string
 import requests
 from datetime import datetime
 from telegram import Update
@@ -34,189 +37,6 @@ CONFIG_DIR = "data/configs"
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
 HISTORICO_MAX = 50
-MAX_RETRIES = 3
-RETRY_DELAY = 3
-
-# ============ CLASSE IQ OPTION SIMPLIFICADA ============
-
-class IQOptionAPI:
-    """API simplificada para IQ Option usando apenas requests"""
-    
-    def __init__(self, email, password):
-        self.email = email
-        self.password = password
-        self.session = requests.Session()
-        self.base_url = "https://iqoption.com/api"
-        self.ws_url = "wss://ws.iqoption.com/echo/websocket"
-        self.logged_in = False
-        self.balance = 0
-        self.token = None
-        self.user_id = None
-        
-    def login(self):
-        """Faz login na IQ Option"""
-        try:
-            # Tentar login
-            login_data = {
-                "email": self.email,
-                "password": self.password
-            }
-            
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
-            
-            response = self.session.post(
-                "https://auth.iqoption.com/api/v1/login",
-                json=login_data,
-                headers=headers,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('code') == 0:
-                    self.logged_in = True
-                    # Pegar token e user_id
-                    self.token = data.get('data', {}).get('token')
-                    self.user_id = data.get('data', {}).get('user_id')
-                    
-                    # Buscar saldo
-                    self._get_balance()
-                    return True, "✅ Login realizado com sucesso!"
-                else:
-                    return False, f"❌ Erro no login: {data.get('msg', 'Erro desconhecido')}"
-            else:
-                return False, f"❌ Erro HTTP: {response.status_code}"
-                
-        except Exception as e:
-            logger.error(f"Erro no login: {e}")
-            return False, f"❌ Erro: {str(e)}"
-    
-    def _get_balance(self):
-        """Busca o saldo da conta"""
-        try:
-            headers = {
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json"
-            }
-            
-            response = self.session.get(
-                f"{self.base_url}/getbalance",
-                headers=headers,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                self.balance = data.get('data', {}).get('balance', 0)
-                return self.balance
-            return 0
-        except:
-            return 0
-    
-    def buy(self, amount, asset, direction, expiry):
-        """Executa uma operação"""
-        try:
-            if not self.logged_in:
-                return False, "Não conectado"
-            
-            # Direção: call = 1, put = 2
-            dir_value = 1 if direction.lower() == 'call' else 2
-            
-            # Tempo de expiração em minutos para segundos
-            expiry_seconds = expiry * 60
-            
-            # Preparar dados da operação
-            trade_data = {
-                "asset_id": self._get_asset_id(asset),
-                "amount": float(amount),
-                "direction": dir_value,
-                "expiry": expiry_seconds,
-                "type": 1  # 1 = opção binária
-            }
-            
-            headers = {
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json"
-            }
-            
-            # Usar o endpoint de buy
-            response = self.session.post(
-                f"{self.base_url}/buy",
-                json=trade_data,
-                headers=headers,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('code') == 0:
-                    order_id = data.get('data', {}).get('order_id')
-                    return True, order_id
-                else:
-                    return False, data.get('msg', 'Erro na operação')
-            else:
-                return False, f"Erro HTTP: {response.status_code}"
-                
-        except Exception as e:
-            logger.error(f"Erro ao comprar: {e}")
-            return False, str(e)
-    
-    def _get_asset_id(self, asset_name):
-        """Converte nome do ativo para ID"""
-        assets = {
-            'EURUSD': 1,
-            'GBPUSD': 2,
-            'USDJPY': 3,
-            'AUDUSD': 4,
-            'USDCAD': 5,
-            'BTCUSD': 6,
-            'ETHUSD': 7,
-            'XRPUSD': 8,
-            # Adicione mais ativos conforme necessário
-        }
-        return assets.get(asset_name.upper(), 1)
-    
-    def check_win(self, order_id):
-        """Verifica resultado de uma operação"""
-        try:
-            headers = {
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json"
-            }
-            
-            response = self.session.get(
-                f"{self.base_url}/get-result/{order_id}",
-                headers=headers,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('code') == 0:
-                    result_data = data.get('data', {})
-                    profit = result_data.get('profit', 0)
-                    status = result_data.get('status', '')
-                    
-                    if profit > 0:
-                        return 'win', profit
-                    elif profit < 0:
-                        return 'loose', abs(profit)
-                    else:
-                        return 'equal', 0
-                else:
-                    return 'erro', 0
-            return 'erro', 0
-        except:
-            return 'erro', 0
-    
-    def get_balance(self):
-        """Retorna o saldo atual"""
-        self._get_balance()
-        return self.balance
 
 class PainelOperacoes:
     def __init__(self):
@@ -326,6 +146,170 @@ class ConfigManager:
         self.config['ativo'] = status
         self.save_config()
 
+# ============ API IQ OPTION SIMPLIFICADA ============
+
+class SimpleIQOption:
+    """API simplificada para IQ Option usando apenas requests"""
+    
+    def __init__(self, email, password):
+        self.email = email
+        self.password = password
+        self.session = requests.Session()
+        self.ssid = None
+        self.logged_in = False
+        self.balance = 0
+        self.user_id = None
+        self.token = None
+        
+        # Headers padrão
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json',
+            'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+            'Origin': 'https://iqoption.com',
+            'Referer': 'https://iqoption.com/pt/',
+        })
+    
+    def login(self):
+        """Faz login na IQ Option"""
+        try:
+            # Primeiro, pegar o SSID
+            login_url = "https://auth.iqoption.com/api/v1/login"
+            
+            payload = {
+                "email": self.email,
+                "password": self.password
+            }
+            
+            response = self.session.post(login_url, json=payload, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0:
+                    self.logged_in = True
+                    self.user_id = data.get('data', {}).get('user_id')
+                    self.token = data.get('data', {}).get('token')
+                    
+                    # Atualizar headers com token
+                    self.session.headers.update({
+                        'Authorization': f'Bearer {self.token}'
+                    })
+                    
+                    # Buscar saldo
+                    self._update_balance()
+                    
+                    return True, "✅ Login realizado com sucesso!"
+                else:
+                    return False, f"❌ Erro no login: {data.get('msg', 'Erro desconhecido')}"
+            else:
+                return False, f"❌ Erro HTTP: {response.status_code}"
+                
+        except Exception as e:
+            logger.error(f"Erro no login: {e}")
+            return False, f"❌ Erro: {str(e)}"
+    
+    def _update_balance(self):
+        """Atualiza o saldo"""
+        try:
+            response = self.session.get(
+                "https://iqoption.com/api/getbalance",
+                timeout=30
+            )
+            if response.status_code == 200:
+                data = response.json()
+                self.balance = data.get('data', {}).get('balance', 0)
+            return self.balance
+        except:
+            return self.balance
+    
+    def get_balance(self):
+        """Retorna o saldo atual"""
+        self._update_balance()
+        return self.balance
+    
+    def get_asset_id(self, asset_name):
+        """Converte nome do ativo para ID"""
+        assets = {
+            'EURUSD': 1, 'EURUSD-OTC': 1,
+            'GBPUSD': 2, 'GBPUSD-OTC': 2,
+            'USDJPY': 3, 'USDJPY-OTC': 3,
+            'AUDUSD': 4, 'AUDUSD-OTC': 4,
+            'USDCAD': 5, 'USDCAD-OTC': 5,
+            'USDCHF': 6, 'USDCHF-OTC': 6,
+            'NZDUSD': 7, 'NZDUSD-OTC': 7,
+            'BTCUSD': 8, 'BTCUSD-OTC': 8,
+            'ETHUSD': 9, 'ETHUSD-OTC': 9,
+            'LTCUSD': 10, 'LTCUSD-OTC': 10,
+            'XRPUSD': 11, 'XRPUSD-OTC': 11,
+        }
+        return assets.get(asset_name.upper(), 1)
+    
+    def buy(self, amount, asset, direction, expiry):
+        """Executa uma operação"""
+        if not self.logged_in:
+            return False, "Não conectado"
+        
+        try:
+            asset_id = self.get_asset_id(asset)
+            direction_value = 1 if direction.lower() == 'call' else 2
+            expiry_seconds = expiry * 60
+            
+            payload = {
+                "asset_id": asset_id,
+                "amount": float(amount),
+                "direction": direction_value,
+                "expiry": expiry_seconds,
+                "type": 1  # 1 = binária
+            }
+            
+            response = self.session.post(
+                "https://iqoption.com/api/buy",
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0:
+                    order_id = data.get('data', {}).get('order_id')
+                    return True, order_id
+                else:
+                    return False, data.get('msg', 'Erro na operação')
+            else:
+                return False, f"Erro HTTP: {response.status_code}"
+                
+        except Exception as e:
+            logger.error(f"Erro ao comprar: {e}")
+            return False, str(e)
+    
+    def check_win(self, order_id):
+        """Verifica resultado de uma operação"""
+        try:
+            response = self.session.get(
+                f"https://iqoption.com/api/get-result/{order_id}",
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0:
+                    result_data = data.get('data', {})
+                    profit = result_data.get('profit', 0)
+                    status = result_data.get('status', '')
+                    
+                    if profit > 0:
+                        return 'win', profit
+                    elif profit < 0:
+                        return 'loose', abs(profit)
+                    else:
+                        return 'equal', 0
+                else:
+                    return 'erro', 0
+            return 'erro', 0
+        except Exception as e:
+            logger.error(f"Erro ao verificar: {e}")
+            return 'erro', 0
+
 class IQOperador:
     def __init__(self, config):
         self.cfg = config
@@ -345,7 +329,7 @@ class IQOperador:
             
             logger.info(f"🔄 Conectando IQ Option...")
             
-            self.api = IQOptionAPI(self.cfg['email'], self.cfg['password'])
+            self.api = SimpleIQOption(self.cfg['email'], self.cfg['password'])
             success, msg = self.api.login()
             
             if not success:
@@ -372,7 +356,6 @@ class IQOperador:
         valor = cfg["valor_entrada"]
         max_gales = min(sinal.get("gales", 0), cfg["max_gales"])
 
-        # Verificar stop loss/win
         if cfg["stop_loss"] > 0 and self.lucro_dia <= -cfg["stop_loss"]:
             return f"🛑 Stop Loss atingido! Lucro: R$ {self.lucro_dia:.2f}"
         
@@ -390,15 +373,6 @@ class IQOperador:
             if tentativa > 0:
                 self.gales_usados += 1
                 bot.send_message(chat_id, f"🔄 Gale {tentativa} → R$ {val_atual:.2f}")
-                self.painel.adicionar({
-                    "hora": datetime.now().strftime("%H:%M:%S"),
-                    "ativo": ativo,
-                    "direcao": direcao,
-                    "status": "GALE",
-                    "valor": val_atual,
-                    "lucro": 0,
-                    "gale": tentativa
-                })
 
             try:
                 success, order_id = self.api.buy(val_atual, ativo, direcao, exp)
@@ -702,7 +676,6 @@ async def get_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         context.user_data['score_minimo'] = score
         
-        # Salvar configuração
         user_id = update.effective_user.id
         config_manager = ConfigManager(user_id)
         config = config_manager.get_config()
@@ -743,7 +716,6 @@ async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Configure o bot primeiro com /start")
         return
     
-    # Conectar
     operador = IQOperador(config)
     success, msg = operador.conectar()
     
@@ -817,13 +789,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
     
-    # Verificar se é sinal
     sinal = parse_sinal(text)
     if not sinal:
         await update.message.reply_text("ℹ️ Envie 'SINAL' para operar.")
         return
     
-    # Processar sinal
     config_manager = ConfigManager(user_id)
     config = config_manager.get_config()
     
@@ -841,7 +811,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data['operador'] = operador
     
-    # Verificar filtros
     if config['confianca_minima'] > 0 and sinal.get('confianca', 100) < config['confianca_minima']:
         await update.message.reply_text(f"⚠️ Confiança {sinal.get('confianca')}% < {config['confianca_minima']}%")
         return
@@ -850,7 +819,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Score {sinal.get('score')} < {config['score_minimo']}")
         return
     
-    # Executar operação
     await update.message.reply_text(
         f"📩 SINAL DETECTADO!\n\n"
         f"💰 Ativo: {sinal['ativo']}\n"
