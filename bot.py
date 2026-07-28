@@ -8,10 +8,11 @@ import re
 import time
 import logging
 import asyncio
+import subprocess
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-from telegram.error import RetryAfter, TimedOut, NetworkError, BadRequest
+from telegram.error import RetryAfter, TimedOut, NetworkError
 from dotenv import load_dotenv
 
 # Carregar variáveis de ambiente
@@ -24,6 +25,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ============ INSTALAÇÃO AUTOMÁTICA DA API ============
+
+def instalar_api():
+    """Instala a API do IQ Option automaticamente"""
+    try:
+        import iqoptionapi
+        logger.info("✅ API IQ Option já instalada")
+        return True
+    except ImportError:
+        logger.info("📦 Instalando IQ Option API...")
+        try:
+            # Tenta instalar a versão mais recente
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "iqoptionapi"])
+            logger.info("✅ API instalada com sucesso!")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Erro ao instalar API: {e}")
+            return False
+
+# Instalar API ao iniciar
+API_INSTALADA = instalar_api()
+
 # Estados da conversa
 (EMAIL, PASSWORD, ACCOUNT_TYPE, VALOR_ENTRADA, MULTIPLICADOR_GALE, 
  MAX_GALES, STOP_LOSS, STOP_WIN, CONFIANCE, SCORE) = range(10)
@@ -33,83 +56,8 @@ CONFIG_DIR = "data/configs"
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
 HISTORICO_MAX = 50
-MAX_RETRIES = 3
-RETRY_DELAY = 5
-
-# ============ FUNÇÃO DE ESCAPE PARA HTML ============
-
-def escape_html(text):
-    """Escapa caracteres especiais para HTML"""
-    if not text:
-        return ""
-    return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-
-# ============ FUNÇÃO PARA ENVIAR MENSAGEM COM RETRY ============
-
-async def send_message_safe(bot, chat_id, text, parse_mode=None, max_retries=3):
-    """Envia mensagem com retry automático em caso de erro"""
-    for attempt in range(max_retries):
-        try:
-            # Tenta enviar com HTML primeiro
-            if parse_mode == 'HTML' or parse_mode is None:
-                await bot.send_message(
-                    chat_id=chat_id, 
-                    text=text, 
-                    parse_mode='HTML'
-                )
-                return True
-            else:
-                await bot.send_message(
-                    chat_id=chat_id, 
-                    text=text, 
-                    parse_mode=parse_mode
-                )
-                return True
-        except BadRequest as e:
-            error_msg = str(e).lower()
-            # Se erro de parse, tenta sem formatação
-            if "parse" in error_msg or "entities" in error_msg:
-                try:
-                    # Remove caracteres que causam erro
-                    clean_text = re.sub(r'[*_`~]', '', text)
-                    await bot.send_message(chat_id=chat_id, text=clean_text, parse_mode=None)
-                    return True
-                except:
-                    # Último recurso: enviar texto puro
-                    await bot.send_message(chat_id=chat_id, text=text, parse_mode=None)
-                    return True
-            logger.error(f"Erro BadRequest: {e}")
-            return False
-        except (TimedOut, NetworkError) as e:
-            logger.warning(f"Erro de rede (tentativa {attempt+1}): {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-            else:
-                logger.error(f"Falha após {max_retries} tentativas")
-                return False
-        except Exception as e:
-            logger.error(f"Erro ao enviar mensagem: {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(RETRY_DELAY)
-            else:
-                return False
-    return False
-
-# ============ FUNÇÃO PARA ENVIAR MENSAGEM FORMATADA ============
-
-async def send_formatted(bot, chat_id, text, use_html=True):
-    """Envia mensagem formatada com fallback automático"""
-    if use_html:
-        # Tentar com HTML
-        success = await send_message_safe(bot, chat_id, text, parse_mode='HTML')
-        if success:
-            return True
-        
-        # Fallback: sem formatação
-        clean_text = re.sub(r'<[^>]+>', '', text)
-        return await send_message_safe(bot, chat_id, clean_text, parse_mode=None)
-    else:
-        return await send_message_safe(bot, chat_id, text, parse_mode=None)
+MAX_RETRIES = 5
+RETRY_DELAY = 3
 
 class PainelOperacoes:
     def __init__(self):
@@ -130,23 +78,23 @@ class PainelOperacoes:
         if op["status"] == "WIN":
             self.stats["wins"] += 1
             self.stats["lucro"] += op["lucro"]
-            self.stats["sequencia"] = max(1, self.stats["sequencia"] + 1) if self.stats["sequencia"] >= 0 else 1
+            self.stats["sequencia"] = self.stats["sequencia"] + 1 if self.stats["sequencia"] >= 0 else 1
         elif op["status"] == "LOSS":
             self.stats["losses"] += 1
             self.stats["lucro"] -= op["valor"]
-            self.stats["sequencia"] = min(-1, self.stats["sequencia"] - 1) if self.stats["sequencia"] <= 0 else -1
+            self.stats["sequencia"] = self.stats["sequencia"] - 1 if self.stats["sequencia"] <= 0 else -1
         elif op["status"] == "GALE":
             self.stats["gales"] += 1
         
         self.stats["melhor_seq"] = max(self.stats["melhor_seq"], self.stats["sequencia"])
         self.stats["pior_seq"] = min(self.stats["pior_seq"], self.stats["sequencia"])
     
-    def get_status_html(self):
+    def get_status(self):
         s = self.stats
         taxa = (s["wins"] / s["total"] * 100) if s["total"] > 0 else 0
         
         status = f"""
-📊 <b>ESTATÍSTICAS</b>
+📊 ESTATÍSTICAS
 ━━━━━━━━━━━━━━━━━━
 📈 Total: {s['total']}
 ✅ Wins: {s['wins']}
@@ -157,7 +105,7 @@ class PainelOperacoes:
 📈 Sequência: {self.formatar_seq(s['sequencia'])}
 🏆 Melhor: {s['melhor_seq']} | ❄️ Pior: {s['pior_seq']}
 ━━━━━━━━━━━━━━━━━━
-📋 <b>ÚLTIMAS 5 OPERAÇÕES</b>
+📋 ÚLTIMAS 5 OPERAÇÕES
 """
         for op in self.operacoes[:5]:
             status += f"\n• {op['hora']} {op['ativo']} "
@@ -192,18 +140,16 @@ class ConfigManager:
     
     def get_default_config(self):
         return {
-            "iqoption": {
-                "email": "",
-                "password": "",
-                "account_type": "PRACTICE",
-                "valor_entrada": 5.0,
-                "multiplicador_gale": 2.0,
-                "max_gales": 1,
-                "stop_loss": 0,
-                "stop_win": 0,
-                "confianca_minima": 0,
-                "score_minimo": 0
-            },
+            "email": "",
+            "password": "",
+            "account_type": "PRACTICE",
+            "valor_entrada": 5.0,
+            "multiplicador_gale": 2.0,
+            "max_gales": 1,
+            "stop_loss": 0,
+            "stop_win": 0,
+            "confianca_minima": 0,
+            "score_minimo": 0,
             "ativo": False
         }
     
@@ -212,14 +158,14 @@ class ConfigManager:
             json.dump(self.config, f, indent=2)
     
     def update(self, key, value):
-        if key in self.config['iqoption']:
-            self.config['iqoption'][key] = value
+        if key in self.config:
+            self.config[key] = value
             self.save_config()
             return True
         return False
     
-    def get_iq_config(self):
-        return self.config['iqoption']
+    def get_config(self):
+        return self.config
     
     def is_active(self):
         return self.config.get('ativo', False)
@@ -239,79 +185,69 @@ class IQOperador:
         self.losses = 0
         self.gales_usados = 0
         self.ativo = False
-        self.reconectando = False
+        self.conectado = False
 
     def conectar(self):
         try:
-            from iqoptionapi.iqapi import IQOptionClient
+            # Importar a API
+            from iqoptionapi.stable_api import IQ_Option
             
             if not self.cfg['email'] or not self.cfg['password']:
                 return False, "❌ Email ou senha não configurados!"
             
-            account_type = 'demo' if self.cfg['account_type'] == 'PRACTICE' else 'real'
+            logger.info(f"🔄 Conectando IQ Option...")
             
-            logger.info(f"Conectando IQ Option ({account_type})...")
+            self.api = IQ_Option(self.cfg['email'], self.cfg['password'])
+            check, reason = self.api.connect()
             
-            self.api = IQOptionClient(
-                self.cfg['email'],
-                self.cfg['password'],
-                account_type=account_type
-            )
-            self.api.connect()
+            if not check:
+                return False, f"❌ Falha na conexão: {reason}"
+            
+            # Mudar para conta correta
+            account_type = 'PRACTICE' if self.cfg['account_type'] == 'PRACTICE' else 'REAL'
+            self.api.change_balance(account_type)
             
             balance = self.api.get_balance()
             self.ativo = True
-            self.reconectando = False
+            self.conectado = True
+            
+            logger.info(f"✅ Conectado! Saldo: R$ {balance:.2f}")
             return True, f"✅ Conectado! Saldo: R$ {balance:.2f}"
             
         except Exception as e:
-            logger.error(f"Erro na conexão: {e}")
+            logger.error(f"❌ Erro na conexão: {e}")
             self.ativo = False
+            self.conectado = False
             return False, f"❌ Erro: {str(e)}"
 
-    def reconectar(self):
-        if self.reconectando:
-            return False, "🔄 Já está tentando reconectar..."
-        
-        self.reconectando = True
-        logger.info("🔄 Tentando reconectar à IQ Option...")
-        
-        for attempt in range(MAX_RETRIES):
-            try:
-                time.sleep(RETRY_DELAY * (attempt + 1))
-                success, msg = self.conectar()
-                if success:
-                    self.reconectando = False
-                    return True, "✅ Reconectado com sucesso!"
-            except Exception as e:
-                logger.warning(f"Tentativa {attempt+1} falhou: {e}")
-        
-        self.reconectando = False
-        return False, "❌ Falha ao reconectar após várias tentativas"
-
-    def checar_resultado(self, order_id, expiry):
+    def checar_resultado(self, id_op):
         try:
             if not self.api:
                 return "erro", 0.0
             
-            success, outcome, pnl = self.api.get_trade_outcome(order_id, expiry)
-            if success:
-                result = outcome.get('result', '').lower()
-                if result == 'win':
-                    return 'win', pnl
-                elif result == 'loose':
-                    return 'loose', abs(pnl)
-                return 'equal', 0.0
-            return 'erro', 0.0
+            resultado = self.api.check_win_v3(id_op)
+            
+            if isinstance(resultado, tuple):
+                status, lucro = resultado
+                return str(status).lower(), float(lucro)
+            elif isinstance(resultado, (int, float)):
+                lucro = float(resultado)
+                if lucro > 0:
+                    return "win", lucro
+                elif lucro < 0:
+                    return "loose", abs(lucro)
+                else:
+                    return "equal", 0.0
+            else:
+                return str(resultado).lower(), 0.0
+                
         except Exception as e:
-            logger.error(f"Erro ao checar resultado: {e}")
+            logger.error(f"❌ Erro ao checar resultado: {e}")
             return "erro", 0.0
 
     def operar(self, sinal, bot, chat_id):
-        if not self.ativo:
-            success, msg = self.reconectar()
-            if not success:
-                return f"❌ {msg}"
+        if not self.conectado or not self.ativo:
+            return "❌ Bot não conectado. Use /iniciar para reconectar."
         
         cfg = self.cfg
         ativo = sinal["ativo"]
@@ -320,13 +256,15 @@ class IQOperador:
         valor = cfg["valor_entrada"]
         max_gales = min(sinal.get("gales", 0), cfg["max_gales"])
 
+        # Verificar stop loss/win
         if cfg["stop_loss"] > 0 and self.lucro_dia <= -cfg["stop_loss"]:
             return f"🛑 Stop Loss atingido! Lucro: R$ {self.lucro_dia:.2f}"
         
         if cfg["stop_win"] > 0 and self.lucro_dia >= cfg["stop_win"]:
             return f"🏆 Stop Win atingido! Lucro: R$ {self.lucro_dia:.2f}"
 
-        asyncio.create_task(send_message_safe(bot, chat_id, f"🎯 {ativo} | {direcao.upper()} | M{exp} | R$ {valor:.2f}"))
+        # Enviar mensagem de início
+        bot.send_message(chat_id, f"🎯 {ativo} | {direcao.upper()} | M{exp} | R$ {valor:.2f}")
 
         tentativa = 0
         resultado_final = ""
@@ -336,7 +274,7 @@ class IQOperador:
 
             if tentativa > 0:
                 self.gales_usados += 1
-                asyncio.create_task(send_message_safe(bot, chat_id, f"🔄 Gale {tentativa} → R$ {val_atual:.2f}"))
+                bot.send_message(chat_id, f"🔄 Gale {tentativa} → R$ {val_atual:.2f}")
                 self.painel.adicionar({
                     "hora": datetime.now().strftime("%H:%M:%S"),
                     "ativo": ativo,
@@ -348,30 +286,16 @@ class IQOperador:
                 })
 
             try:
-                if not self.api:
-                    success, msg = self.reconectar()
-                    if not success:
-                        return f"❌ {msg}"
-
-                from iqoptionapi.models import OptionsTradeParams, Direction, OptionType
+                # Executar trade
+                check, id_op = self.api.buy(val_atual, ativo, direcao, exp)
                 
-                trade_params = OptionsTradeParams(
-                    asset=ativo,
-                    expiry=exp,
-                    amount=val_atual,
-                    direction=Direction.CALL if direcao.lower() == 'call' else Direction.PUT,
-                    option_type=OptionType.BINARY_OPTION
-                )
+                if not check:
+                    return f"❌ Ordem rejeitada: {id_op}"
 
-                success, order_id = self.api.execute_options_trade(trade_params)
-                
-                if not success:
-                    return f"❌ Ordem rejeitada: {order_id}"
-
-                asyncio.create_task(send_message_safe(bot, chat_id, f"⏳ Aguardando resultado (M{exp})..."))
+                bot.send_message(chat_id, f"⏳ Aguardando resultado (M{exp})...")
                 time.sleep(exp * 60 + 5)
                 
-                status, lucro = self.checar_resultado(order_id, exp)
+                status, lucro = self.checar_resultado(id_op)
                 self.operacoes += 1
 
                 if status == "win":
@@ -389,7 +313,7 @@ class IQOperador:
                         "gale": tentativa
                     })
                     
-                    asyncio.create_task(send_message_safe(bot, chat_id, resultado_final))
+                    bot.send_message(chat_id, resultado_final)
                     break
                     
                 elif status in ("loose", "loss"):
@@ -407,34 +331,37 @@ class IQOperador:
                         "gale": tentativa
                     })
                     
-                    asyncio.create_task(send_message_safe(bot, chat_id, resultado_final))
+                    bot.send_message(chat_id, resultado_final)
                     
                     tentativa += 1
                     if tentativa > max_gales:
-                        asyncio.create_task(send_message_safe(bot, chat_id, "🚫 Sem mais gales."))
+                        bot.send_message(chat_id, "🚫 Sem mais gales.")
                         
                 elif status == "equal":
-                    asyncio.create_task(send_message_safe(bot, chat_id, "〰️ EMPATE (doji)"))
+                    bot.send_message(chat_id, "〰️ EMPATE (doji)")
                     break
                 else:
-                    asyncio.create_task(send_message_safe(bot, chat_id, f"Status: {status}"))
+                    bot.send_message(chat_id, f"Status: {status}")
                     break
 
             except Exception as e:
                 error_msg = f"❌ Erro: {str(e)}"
                 logger.error(error_msg)
-                asyncio.create_task(send_message_safe(bot, chat_id, error_msg))
+                bot.send_message(chat_id, error_msg)
                 
+                # Tentar reconectar
                 if "connection" in str(e).lower() or "timeout" in str(e).lower():
-                    success, msg = self.reconectar()
+                    bot.send_message(chat_id, "🔄 Tentando reconectar...")
+                    success, msg = self.conectar()
                     if success:
+                        bot.send_message(chat_id, "✅ Reconectado!")
                         continue
                 break
 
         if self.operacoes > 0:
             taxa = (self.wins / self.operacoes * 100) if self.operacoes > 0 else 0
             summary = f"📊 {self.operacoes} ops | {self.wins}W/{self.losses}L | {taxa:.0f}% | R$ {self.lucro_dia:.2f}"
-            asyncio.create_task(send_message_safe(bot, chat_id, summary))
+            bot.send_message(chat_id, summary)
         
         return resultado_final
 
@@ -475,13 +402,13 @@ def parse_sinal(texto):
         return sinal
     return None
 
-# ============ HANDLERS DO TELEGRAM (VERSÃO SEM MARKDOWN) ============
+# ============ HANDLERS DO TELEGRAM ============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Inicia a configuração do bot"""
     user_id = update.effective_user.id
     config_manager = ConfigManager(user_id)
-    config = config_manager.get_iq_config()
+    config = config_manager.get_config()
     
     if config['email'] and config['password']:
         msg = (
@@ -494,73 +421,54 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏆 Stop Win: R$ {config['stop_win']:.2f}\n"
             f"🔍 Confiança: {config['confianca_minima']}%\n"
             f"🛡️ Score: {config['score_minimo']}/100\n\n"
-            f"📌 Comandos disponíveis:\n"
-            f"/start - Mostrar esta mensagem\n"
-            f"/config - Reconfigurar bot\n"
-            f"/status - Ver estatísticas\n"
+            f"📌 Comandos:\n"
+            f"/start - Menu\n"
+            f"/config - Reconfigurar\n"
+            f"/status - Estatísticas\n"
             f"/stop - Parar bot\n"
             f"/iniciar - Iniciar bot\n\n"
-            f"ℹ️ Envie mensagens com 'SINAL' para executar operações"
+            f"ℹ️ Envie 'SINAL' para operar"
         )
-        await send_message_safe(update.message.bot, update.effective_chat.id, msg)
+        await update.message.reply_text(msg)
         return ConversationHandler.END
     
-    msg = (
+    await update.message.reply_text(
         "🤖 Bem-vindo ao Quantum Bot!\n\n"
         "Vamos configurar seu bot passo a passo.\n"
-        "Digite /cancel a qualquer momento para cancelar.\n\n"
+        "Digite /cancel para cancelar.\n\n"
         "📧 Digite seu email da IQ Option:"
     )
-    await send_message_safe(update.message.bot, update.effective_chat.id, msg)
     return EMAIL
 
-async def config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reconfigura o bot"""
-    await send_message_safe(
-        update.message.bot,
-        update.effective_chat.id,
-        "🔄 Reconfiguração\n\nDigite /start para reiniciar a configuração."
-    )
-    return ConversationHandler.END
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancela a configuração"""
-    await send_message_safe(update.message.bot, update.effective_chat.id, "❌ Configuração cancelada.")
+    await update.message.reply_text("❌ Configuração cancelada.")
     return ConversationHandler.END
 
 async def get_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe o email"""
     email = update.message.text.strip()
     if '@' not in email:
-        await send_message_safe(update.message.bot, update.effective_chat.id, "⚠️ Email inválido. Digite um email válido:")
+        await update.message.reply_text("⚠️ Email inválido. Digite novamente:")
         return EMAIL
     
     context.user_data['email'] = email
-    await send_message_safe(
-        update.message.bot,
-        update.effective_chat.id,
-        f"📧 Email: {email}\n\n🔑 Digite sua senha da IQ Option:"
-    )
+    await update.message.reply_text(f"📧 Email: {email}\n\n🔑 Digite sua senha:")
     return PASSWORD
 
 async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe a senha"""
     password = update.message.text.strip()
     if len(password) < 4:
-        await send_message_safe(update.message.bot, update.effective_chat.id, "⚠️ Senha muito curta. Digite novamente:")
+        await update.message.reply_text("⚠️ Senha muito curta. Digite novamente:")
         return PASSWORD
     
     context.user_data['password'] = password
-    
-    await send_message_safe(
-        update.message.bot,
-        update.effective_chat.id,
-        f"🔑 Senha: {'*' * len(password)}\n\n💳 Tipo de conta:\nDigite '1' para DEMO ou '2' para REAL"
+    await update.message.reply_text(
+        f"🔑 Senha: {'*' * len(password)}\n\n"
+        f"💳 Tipo de conta:\n"
+        f"Digite '1' para DEMO ou '2' para REAL"
     )
     return ACCOUNT_TYPE
 
 async def get_account_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe o tipo de conta"""
     choice = update.message.text.strip()
     
     if choice == '1':
@@ -568,162 +476,138 @@ async def get_account_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif choice == '2':
         account_type = 'REAL'
     else:
-        await send_message_safe(update.message.bot, update.effective_chat.id, "⚠️ Digite '1' para DEMO ou '2' para REAL:")
+        await update.message.reply_text("⚠️ Digite '1' para DEMO ou '2' para REAL:")
         return ACCOUNT_TYPE
     
     context.user_data['account_type'] = account_type
-    
-    await send_message_safe(
-        update.message.bot,
-        update.effective_chat.id,
-        f"💳 Conta: {account_type}\n\n💰 Valor de entrada (mínimo R$ 1.00):\nDigite o valor (exemplo: 5.00)"
+    await update.message.reply_text(
+        f"💳 Conta: {account_type}\n\n"
+        f"💰 Valor de entrada (mínimo R$ 1.00):"
     )
     return VALOR_ENTRADA
 
 async def get_valor_entrada(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe o valor de entrada"""
     try:
         valor = float(update.message.text.strip())
         if valor < 1:
-            await send_message_safe(update.message.bot, update.effective_chat.id, "⚠️ Valor mínimo é R$ 1.00. Digite novamente:")
+            await update.message.reply_text("⚠️ Valor mínimo é R$ 1.00. Digite novamente:")
             return VALOR_ENTRADA
         
         context.user_data['valor_entrada'] = valor
-        
-        await send_message_safe(
-            update.message.bot,
-            update.effective_chat.id,
-            f"💰 Entrada: R$ {valor:.2f}\n\n🔄 Multiplicador do Gale:\nDigite o multiplicador (exemplo: 2.0)"
+        await update.message.reply_text(
+            f"💰 Entrada: R$ {valor:.2f}\n\n"
+            f"🔄 Multiplicador do Gale (ex: 2.0):"
         )
         return MULTIPLICADOR_GALE
     except ValueError:
-        await send_message_safe(update.message.bot, update.effective_chat.id, "❌ Digite um número válido. Exemplo: 5.00")
+        await update.message.reply_text("❌ Digite um número válido.")
         return VALOR_ENTRADA
 
 async def get_multiplicador_gale(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe o multiplicador do gale"""
     try:
         multi = float(update.message.text.strip())
         if multi < 1:
-            await send_message_safe(update.message.bot, update.effective_chat.id, "⚠️ Multiplicador deve ser >= 1. Digite novamente:")
+            await update.message.reply_text("⚠️ Multiplicador deve ser >= 1:")
             return MULTIPLICADOR_GALE
         
         context.user_data['multiplicador_gale'] = multi
-        
-        await send_message_safe(
-            update.message.bot,
-            update.effective_chat.id,
-            f"🔄 Multiplicador: {multi}x\n\n📊 Número máximo de Gales:\nDigite o número (exemplo: 1)"
+        await update.message.reply_text(
+            f"🔄 Multiplicador: {multi}x\n\n"
+            f"📊 Número máximo de Gales:"
         )
         return MAX_GALES
     except ValueError:
-        await send_message_safe(update.message.bot, update.effective_chat.id, "❌ Digite um número válido. Exemplo: 2.0")
+        await update.message.reply_text("❌ Digite um número válido.")
         return MULTIPLICADOR_GALE
 
 async def get_max_gales(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe o número máximo de gales"""
     try:
         max_gales = int(update.message.text.strip())
         if max_gales < 0:
-            await send_message_safe(update.message.bot, update.effective_chat.id, "⚠️ Digite um número >= 0. Digite novamente:")
+            await update.message.reply_text("⚠️ Digite um número >= 0:")
             return MAX_GALES
         
         context.user_data['max_gales'] = max_gales
-        
-        await send_message_safe(
-            update.message.bot,
-            update.effective_chat.id,
-            f"📊 Max Gales: {max_gales}\n\n🛑 Stop Loss (0 para desativar):\nDigite o valor (exemplo: 50.00)"
+        await update.message.reply_text(
+            f"📊 Max Gales: {max_gales}\n\n"
+            f"🛑 Stop Loss (0 para desativar):"
         )
         return STOP_LOSS
     except ValueError:
-        await send_message_safe(update.message.bot, update.effective_chat.id, "❌ Digite um número inteiro válido.")
+        await update.message.reply_text("❌ Digite um número inteiro.")
         return MAX_GALES
 
 async def get_stop_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe o stop loss"""
     try:
         stop_loss = float(update.message.text.strip())
         if stop_loss < 0:
-            await send_message_safe(update.message.bot, update.effective_chat.id, "⚠️ Digite um número >= 0. Digite novamente:")
+            await update.message.reply_text("⚠️ Digite um número >= 0:")
             return STOP_LOSS
         
         context.user_data['stop_loss'] = stop_loss
-        
-        await send_message_safe(
-            update.message.bot,
-            update.effective_chat.id,
-            f"🛑 Stop Loss: R$ {stop_loss:.2f}\n\n🏆 Stop Win (0 para desativar):\nDigite o valor (exemplo: 100.00)"
+        await update.message.reply_text(
+            f"🛑 Stop Loss: R$ {stop_loss:.2f}\n\n"
+            f"🏆 Stop Win (0 para desativar):"
         )
         return STOP_WIN
     except ValueError:
-        await send_message_safe(update.message.bot, update.effective_chat.id, "❌ Digite um número válido. Exemplo: 50.00")
+        await update.message.reply_text("❌ Digite um número válido.")
         return STOP_LOSS
 
 async def get_stop_win(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe o stop win"""
     try:
         stop_win = float(update.message.text.strip())
         if stop_win < 0:
-            await send_message_safe(update.message.bot, update.effective_chat.id, "⚠️ Digite um número >= 0. Digite novamente:")
+            await update.message.reply_text("⚠️ Digite um número >= 0:")
             return STOP_WIN
         
         context.user_data['stop_win'] = stop_win
-        
-        await send_message_safe(
-            update.message.bot,
-            update.effective_chat.id,
-            f"🏆 Stop Win: R$ {stop_win:.2f}\n\n🔍 Confiança mínima (0 para ignorar):\nDigite o valor (exemplo: 70)"
+        await update.message.reply_text(
+            f"🏆 Stop Win: R$ {stop_win:.2f}\n\n"
+            f"🔍 Confiança mínima (0 para ignorar):"
         )
         return CONFIANCE
     except ValueError:
-        await send_message_safe(update.message.bot, update.effective_chat.id, "❌ Digite um número válido. Exemplo: 100.00")
+        await update.message.reply_text("❌ Digite um número válido.")
         return STOP_WIN
 
 async def get_confiance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe a confiança mínima"""
     try:
         confiance = int(update.message.text.strip())
         if confiance < 0 or confiance > 100:
-            await send_message_safe(update.message.bot, update.effective_chat.id, "⚠️ Digite um número entre 0 e 100. Digite novamente:")
+            await update.message.reply_text("⚠️ Digite entre 0 e 100:")
             return CONFIANCE
         
         context.user_data['confianca_minima'] = confiance
-        
-        await send_message_safe(
-            update.message.bot,
-            update.effective_chat.id,
-            f"🔍 Confiança mínima: {confiance}%\n\n🛡️ Score mínimo (0 para ignorar):\nDigite o valor (exemplo: 80)"
+        await update.message.reply_text(
+            f"🔍 Confiança: {confiance}%\n\n"
+            f"🛡️ Score mínimo (0 para ignorar):"
         )
         return SCORE
     except ValueError:
-        await send_message_safe(update.message.bot, update.effective_chat.id, "❌ Digite um número inteiro válido.")
+        await update.message.reply_text("❌ Digite um número inteiro.")
         return CONFIANCE
 
 async def get_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe o score mínimo"""
     try:
         score = int(update.message.text.strip())
         if score < 0 or score > 100:
-            await send_message_safe(update.message.bot, update.effective_chat.id, "⚠️ Digite um número entre 0 e 100. Digite novamente:")
+            await update.message.reply_text("⚠️ Digite entre 0 e 100:")
             return SCORE
         
         context.user_data['score_minimo'] = score
         
+        # Salvar configuração
         user_id = update.effective_user.id
         config_manager = ConfigManager(user_id)
+        config = config_manager.get_config()
         
-        config = config_manager.get_iq_config()
-        config['email'] = context.user_data.get('email', '')
-        config['password'] = context.user_data.get('password', '')
-        config['account_type'] = context.user_data.get('account_type', 'PRACTICE')
-        config['valor_entrada'] = context.user_data.get('valor_entrada', 5.0)
-        config['multiplicador_gale'] = context.user_data.get('multiplicador_gale', 2.0)
-        config['max_gales'] = context.user_data.get('max_gales', 1)
-        config['stop_loss'] = context.user_data.get('stop_loss', 0)
-        config['stop_win'] = context.user_data.get('stop_win', 0)
-        config['confianca_minima'] = context.user_data.get('confianca_minima', 0)
-        config['score_minimo'] = context.user_data.get('score_minimo', 0)
+        for key in ['email', 'password', 'account_type', 'valor_entrada', 
+                   'multiplicador_gale', 'max_gales', 'stop_loss', 'stop_win',
+                   'confianca_minima', 'score_minimo']:
+            if key in context.user_data:
+                config[key] = context.user_data[key]
+        
         config_manager.save_config()
         
         summary = (
@@ -731,75 +615,88 @@ async def get_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📧 Email: {config['email']}\n"
             f"💳 Conta: {config['account_type']}\n"
             f"💰 Entrada: R$ {config['valor_entrada']:.2f}\n"
-            f"🔄 Gale: {config['multiplicador_gale']}x (max {config['max_gales']})\n"
+            f"🔄 Gale: {config['multiplicador_gale']}x\n"
+            f"📊 Max Gales: {config['max_gales']}\n"
             f"🛑 Stop Loss: R$ {config['stop_loss']:.2f}\n"
             f"🏆 Stop Win: R$ {config['stop_win']:.2f}\n"
             f"🔍 Confiança: {config['confianca_minima']}%\n"
             f"🛡️ Score: {config['score_minimo']}/100\n\n"
-            f"Digite /iniciar para conectar e iniciar o bot!"
+            f"Digite /iniciar para conectar!"
         )
-        await send_message_safe(update.message.bot, update.effective_chat.id, summary)
-        
+        await update.message.reply_text(summary)
         return ConversationHandler.END
     except ValueError:
-        await send_message_safe(update.message.bot, update.effective_chat.id, "❌ Digite um número inteiro válido.")
+        await update.message.reply_text("❌ Digite um número inteiro.")
         return SCORE
 
 async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia o bot"""
+    """Inicia o bot conectando à IQ Option"""
     user_id = update.effective_user.id
     config_manager = ConfigManager(user_id)
-    config = config_manager.get_iq_config()
+    config = config_manager.get_config()
     
     if not config['email'] or not config['password']:
-        await send_message_safe(update.message.bot, update.effective_chat.id, "❌ Configure o bot primeiro com /start")
+        await update.message.reply_text("❌ Configure o bot primeiro com /start")
         return
     
+    # Verificar se a API está instalada
+    if not API_INSTALADA:
+        await update.message.reply_text(
+            "⚠️ API do IQ Option não está instalada!\n"
+            "Tentando instalar automaticamente..."
+        )
+        if instalar_api():
+            await update.message.reply_text("✅ API instalada! Tentando conectar...")
+        else:
+            await update.message.reply_text(
+                "❌ Falha ao instalar API.\n"
+                "Execute manualmente: pip install iqoptionapi"
+            )
+            return
+    
+    # Conectar
     operador = IQOperador(config)
     success, msg = operador.conectar()
     
     if not success:
-        await send_message_safe(update.message.bot, update.effective_chat.id, f"❌ {msg}\nUse /start para reconfigurar.")
+        await update.message.reply_text(f"❌ {msg}\nUse /start para reconfigurar.")
         return
     
     context.user_data['operador'] = operador
     config_manager.set_active(True)
     
-    await send_message_safe(
-        update.message.bot,
-        update.effective_chat.id,
+    await update.message.reply_text(
         f"🚀 BOT INICIADO!\n\n"
         f"✅ IQ Option Conectado\n"
         f"📧 {config['email']}\n"
         f"💰 Saldo: R$ {operador.api.get_balance():.2f}\n\n"
-        f"📌 Envie mensagens com 'SINAL' para executar operações\n"
+        f"📌 Envie 'SINAL' para operar\n"
         f"🔧 Comandos: /status, /stop"
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostra status atual"""
     user_id = update.effective_user.id
     config_manager = ConfigManager(user_id)
-    config = config_manager.get_iq_config()
-    
+    config = config_manager.get_config()
     operador = context.user_data.get('operador')
     
-    if operador and operador.ativo:
+    if operador and operador.conectado:
         status_text = (
             f"🤖 STATUS DO BOT\n\n"
             f"📧 Email: {config['email']}\n"
             f"💳 Conta: {config['account_type']}\n"
             f"💰 Entrada: R$ {config['valor_entrada']:.2f}\n"
             f"🔄 Gale: {config['multiplicador_gale']}x\n"
-            f"🛑 Stop: L: R$ {config['stop_loss']:.2f} | W: R$ {config['stop_win']:.2f}\n\n"
-            f"{operador.painel.get_status_html()}"
+            f"🛑 Stop: L: R$ {config['stop_loss']:.2f} | W: R$ {config['stop_win']:.2f}\n"
+            f"🔍 Confiança: {config['confianca_minima']}%\n"
+            f"🛡️ Score: {config['score_minimo']}/100\n\n"
+            f"{operador.painel.get_status()}"
         )
-        await send_message_safe(update.message.bot, update.effective_chat.id, status_text)
+        await update.message.reply_text(status_text)
     else:
-        await send_message_safe(update.message.bot, update.effective_chat.id, "❌ Bot não está ativo. Use /iniciar para iniciar.")
+        await update.message.reply_text("❌ Bot não está ativo. Use /iniciar.")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Para o bot"""
     user_id = update.effective_user.id
     config_manager = ConfigManager(user_id)
     config_manager.set_active(False)
@@ -807,21 +704,15 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'operador' in context.user_data:
         operador = context.user_data['operador']
         operador.ativo = False
-        if operador.api:
-            try:
-                operador.api.disconnect()
-            except:
-                pass
+        operador.conectado = False
     
-    await send_message_safe(update.message.bot, update.effective_chat.id, "⏹️ Bot parado com sucesso!")
+    await update.message.reply_text("⏹️ Bot parado com sucesso!")
     
     if 'operador' in context.user_data:
         operador = context.user_data['operador']
         if operador.operacoes > 0:
             taxa = (operador.wins / operador.operacoes * 100) if operador.operacoes > 0 else 0
-            await send_message_safe(
-                update.message.bot,
-                update.effective_chat.id,
+            await update.message.reply_text(
                 f"📊 RESUMO FINAL\n\n"
                 f"📈 Total: {operador.operacoes}\n"
                 f"✅ Wins: {operador.wins}\n"
@@ -830,67 +721,51 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💰 Lucro: R$ {operador.lucro_dia:.2f}"
             )
 
+async def config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reconfigura o bot"""
+    await update.message.reply_text("🔄 Use /start para reconfigurar completamente.")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processa mensagens do usuário"""
     user_id = update.effective_user.id
     text = update.message.text
     chat_id = update.effective_chat.id
-    username = update.effective_user.username or "Usuário"
     
     # Verificar se é sinal
     sinal = parse_sinal(text)
     if not sinal:
-        await send_message_safe(
-            update.message.bot,
-            chat_id,
-            f"ℹ️ Mensagem recebida de @{username}. Aguardando sinais com 'SINAL'..."
-        )
+        await update.message.reply_text("ℹ️ Envie 'SINAL' para operar.")
         return
     
     # Processar sinal
     config_manager = ConfigManager(user_id)
-    config = config_manager.get_iq_config()
+    config = config_manager.get_config()
     
     if not config_manager.is_active():
-        await send_message_safe(
-            update.message.bot,
-            chat_id,
-            "❌ Bot está parado. Use /iniciar para iniciar."
-        )
+        await update.message.reply_text("❌ Bot está parado. Use /iniciar.")
         return
     
-    # Verificar se tem operador
     operador = context.user_data.get('operador')
-    if not operador or not operador.ativo:
-        await send_message_safe(update.message.bot, chat_id, "🔄 Reconectando IQ Option...")
+    if not operador or not operador.conectado:
+        await update.message.reply_text("🔄 Reconectando...")
         operador = IQOperador(config)
         success, msg = operador.conectar()
         if not success:
-            await send_message_safe(update.message.bot, chat_id, f"❌ {msg}")
+            await update.message.reply_text(f"❌ {msg}")
             return
         context.user_data['operador'] = operador
     
     # Verificar filtros
     if config['confianca_minima'] > 0 and sinal.get('confianca', 100) < config['confianca_minima']:
-        await send_message_safe(
-            update.message.bot,
-            chat_id,
-            f"⚠️ SINAL REJEITADO!\n\nConfiança {sinal.get('confianca')}% < {config['confianca_minima']}%"
-        )
+        await update.message.reply_text(f"⚠️ Confiança {sinal.get('confianca')}% < {config['confianca_minima']}%")
         return
     
     if config['score_minimo'] > 0 and sinal.get('score', 100) < config['score_minimo']:
-        await send_message_safe(
-            update.message.bot,
-            chat_id,
-            f"⚠️ SINAL REJEITADO!\n\nScore {sinal.get('score')} < {config['score_minimo']}"
-        )
+        await update.message.reply_text(f"⚠️ Score {sinal.get('score')} < {config['score_minimo']}")
         return
     
     # Executar operação
-    await send_message_safe(
-        update.message.bot,
-        chat_id,
+    await update.message.reply_text(
         f"📩 SINAL DETECTADO!\n\n"
         f"💰 Ativo: {sinal['ativo']}\n"
         f"📈 Direção: {sinal['direcao'].upper()}\n"
@@ -907,11 +782,12 @@ def main():
     
     if not token:
         logger.error("❌ TELEGRAM_BOT_TOKEN não configurado!")
-        logger.info("Configure a variável de ambiente TELEGRAM_BOT_TOKEN")
         return
     
+    # Criar aplicação
     application = Application.builder().token(token).build()
     
+    # Conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -929,6 +805,7 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)],
     )
     
+    # Adicionar handlers
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler('config', config))
     application.add_handler(CommandHandler('iniciar', iniciar))
@@ -936,19 +813,20 @@ def main():
     application.add_handler(CommandHandler('stop', stop))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
+    # Iniciar bot com reconexão automática
     logger.info("🚀 Bot iniciado!")
     
     while True:
         try:
             application.run_polling(allowed_updates=Update.ALL_TYPES)
         except (NetworkError, TimedOut) as e:
-            logger.error(f"Erro de rede: {e}. Tentando reconectar em 10 segundos...")
+            logger.error(f"Erro de rede: {e}. Reconectando em 10s...")
             time.sleep(10)
         except KeyboardInterrupt:
-            logger.info("🛑 Bot interrompido pelo usuário")
+            logger.info("🛑 Bot interrompido")
             break
         except Exception as e:
-            logger.error(f"Erro fatal: {e}. Tentando reiniciar em 30 segundos...")
+            logger.error(f"Erro: {e}. Reiniciando em 30s...")
             time.sleep(30)
 
 if __name__ == "__main__":
