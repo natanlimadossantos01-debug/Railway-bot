@@ -1,15 +1,4 @@
-# Core
-telethon==1.34.0
-
-# IQ Option API (Nova API do Sudip-T)
-git+https://github.com/Sudip-T/iqoption-api.git
-
-# Dependências da IQ Option API (instaladas automaticamente)
-websocket-client==1.6.1
-requests==2.31.0
-python-dotenv==1.0.0
-pandas==2.1.0
-mplfinance==0.12.9b0
-
-# Opcional: Para logging colorido
-colorama==0.4.6
+# requirements.txt
+python-telegram-bot==20.7
+numpy==1.24.3
+iqoption-async==0.0.6
