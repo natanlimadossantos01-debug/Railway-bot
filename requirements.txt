@@ -1,2 +1,4 @@
 telethon==1.36.0
-iqoptionapi==2.10.1
+websocket-client==1.6.1
+requests==2.31.0
+six==1.16.0
