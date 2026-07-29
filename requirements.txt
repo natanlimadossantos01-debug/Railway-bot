@@ -1,4 +1,5 @@
-# requirements.txt
-python-telegram-bot==20.7
-numpy==1.24.3
+python-telegram-bot==20.8
+numpy==1.26.4
 iqoption-async==0.0.6
+websocket-client==1.7.0
+python-dateutil==2.9.0
