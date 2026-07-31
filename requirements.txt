@@ -1,5 +1,5 @@
-telethon==1.36.0
-git+https://github.com/n1kto/iqoption-api.git
-websocket-client==1.6.1
-requests==2.31.0
-six==1.16.0
+streamlit
+iqoptionapi
+telethon
+colorama
+requests
