@@ -1,7 +1,6 @@
 streamlit
-iqoption-api
+git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
 telethon
 colorama
 requests
 websocket-client
-pylint
