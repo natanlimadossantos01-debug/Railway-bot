@@ -1,5 +1,7 @@
 streamlit
-iqoptionapi
+iqoption-api
 telethon
 colorama
 requests
+websocket-client
+pylint
