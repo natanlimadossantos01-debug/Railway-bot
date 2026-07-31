@@ -1,115 +1,116 @@
 import streamlit as st
 import asyncio
-import json
-import os
-import re
+import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from iqoptionapi.stable_api import IQ_Option
 from telethon import TelegramClient, events
 
-# Configurações Globais
-FUSO_BR = timezone(timedelta(hours=-3))
-CONFIG_FILE = "config.json"
+# ──────────────────────────────────────────
+# CONFIGURAÇÕES FIXAS DO ADMIN (VOCÊ)
+# ──────────────────────────────────────────
+ADMIN_API_ID = 22453120
+ADMIN_API_HASH = "89826a4104518e9ed650cdb451ad8b53"
+CANAL_SINAIS = -1004375564920
 
-# --- Funções Auxiliares ---
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        return {"telegram": {}, "iqoption": {}}
-    with open(CONFIG_FILE, "r") as f:
-        return json.load(f)
+# ──────────────────────────────────────────
+# LÓGICA DO BOT (RODA EM SEGUNDO PLANO)
+# ──────────────────────────────────────────
 
-def save_config(cfg):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-
-def parse_sinal_avancado(texto):
-    t = texto.upper()
-    ativo = None
-    match_par = re.search(r'PAR[:\s]+([A-Z0-9\/\-]+)', t)
-    if match_par:
-        ativo = match_par.group(1).replace("/", "").replace("-", "")
-    
-    direcao = None
-    if "COMPRA" in t or "CALL" in t: direcao = "call"
-    elif "VENDA" in t or "PUT" in t: direcao = "put"
+def iniciar_bot_aluno(dados_aluno):
+    """Função que conecta na IQ do aluno e escuta o seu canal."""
+    try:
+        # 1. Conecta na IQ Option do Aluno
+        api = IQ_Option(dados_aluno['email'], dados_aluno['senha'])
+        check, reason = api.connect()
         
-    horario = None
-    match_hora = re.search(r'HOR[AÁ]RIO.*?(\d{1,2}:\d{2})', t)
-    if match_hora: horario = match_hora.group(1)
+        if not check:
+            dados_aluno['status'] = f"❌ Erro IQ: {reason}"
+            return
+
+        api.change_balance(dados_aluno['conta'])
+        dados_aluno['saldo'] = api.get_balance()
+        dados_aluno['status'] = "✅ Bot Ativo! Aguardando sinais..."
+
+        # 2. Conecta no Telegram com SUAS credenciais para ouvir o canal
+        async def listener():
+            client = TelegramClient("session_temp", ADMIN_API_ID, ADMIN_API_HASH)
+            await client.start()
             
-    if ativo and direcao and horario:
-        return {"ativo": ativo, "direcao": direcao, "horario": horario}
-    return None
+            @client.on(events.NewMessage(chats=CANAL_SINAIS))
+            async def handler(event):
+                texto = event.message.text or ""
+                # Aqui entraria seu parser de sinal original
+                if "SINAL" in texto.upper():
+                    dados_aluno['ultimo_sinal'] = f"📡 Sinal detectado às {datetime.now().strftime('%H:%M')}"
+                    # Simulação de operação (substitua pela sua lógica de buy/put)
+                    # api.buy(...) 
+            
+            await client.run_until_disconnected()
 
-# --- Interface Streamlit ---
-st.set_page_config(page_title="Quantum IQ Bot Web", page_icon="🚀", layout="wide")
-st.title("🚀 Quantum IQ Bot - Painel de Controle")
+        # Roda o listener em um loop de eventos separado
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(listener())
 
-cfg = load_config()
+    except Exception as e:
+        dados_aluno['status'] = f"⚠️ Erro: {str(e)}"
 
-# Abas para organização
-tab1, tab2, tab3 = st.tabs(["⚙️ Configuração", "📊 Monitoramento", "💬 Logs"])
+# ──────────────────────────────────────────
+# INTERFACE DO USUÁRIO (STREAMLIT)
+# ──────────────────────────────────────────
 
-with tab1:
-    st.header("Configurações do Sistema")
+st.set_page_config(page_title="Quantum IQ Bot - Acesso Aluno", layout="centered")
+st.title("⚛️ Quantum IQ Bot - Portal do Aluno")
+
+if 'bot_ativo' not in st.session_state:
+    st.session_state.bot_ativo = False
+    st.session_state.dados = {"status": "Parado", "saldo": 0.0, "ultimo_sinal": "-"}
+
+with st.form("login_form"):
+    st.header("🔐 Suas Credenciais IQ Option")
+    email = st.text_input("E-mail da Conta")
+    senha = st.text_input("Senha", type="password")
+    conta = st.selectbox("Tipo de Conta", ["PRACTICE", "REAL"])
+    
     col1, col2 = st.columns(2)
-    
     with col1:
-        st.subheader("Telegram API")
-        api_id = st.text_input("API ID", value=cfg.get("telegram", {}).get("api_id", ""))
-        api_hash = st.text_input("API Hash", value=cfg.get("telegram", {}).get("api_hash", ""), type="password")
-        channel_id = st.text_input("ID do Canal", value=cfg.get("telegram", {}).get("channel_link", ""))
-    
+        entrada = st.number_input("Valor Entrada (R$)", value=5.0)
     with col2:
-        st.subheader("IQ Option")
-        email = st.text_input("E-mail", value=cfg.get("iqoption", {}).get("email", ""))
-        senha = st.text_input("Senha", value=cfg.get("iqoption", {}).get("password", ""), type="password")
-        account_type = st.selectbox("Tipo de Conta", ["PRACTICE", "REAL"], index=0 if cfg.get("iqoption", {}).get("account_type") == "PRACTICE" else 1)
-        valor_entrada = st.number_input("Valor Entrada (R$)", min_value=1.0, value=float(cfg.get("iqoption", {}).get("valor_entrada", 5.0)))
-        stop_win = st.number_input("Stop Win (R$)", min_value=0.0, value=float(cfg.get("iqoption", {}).get("stop_win", 50.0)))
-        stop_loss = st.number_input("Stop Loss (R$)", min_value=0.0, value=float(cfg.get("iqoption", {}).get("stop_loss", 50.0)))
+        stop_win = st.number_input("Stop Win (R$)", value=50.0)
 
-    if st.button("💾 Salvar Configurações"):
-        new_cfg = {
-            "telegram": {"api_id": api_id, "api_hash": api_hash, "channel_link": channel_id},
-            "iqoption": {
-                "email": email, "password": senha, "account_type": account_type,
-                "valor_entrada": valor_entrada, "stop_win": stop_win, "stop_loss": stop_loss
-            }
+    submitted = st.form_submit_button("🚀 INICIAR BOT AUTOMÁTICO")
+
+if submitted:
+    if email and senha:
+        st.session_state.dados = {
+            "email": email, "senha": senha, "conta": conta,
+            "entrada": entrada, "stop_win": stop_win,
+            "status": "Iniciando conexão...", "saldo": 0.0, "ultimo_sinal": "-"
         }
-        save_config(new_cfg)
-        st.success("Configurações salvas com sucesso!")
-
-with tab2:
-    st.header("Status da Operação")
-    
-    # Inicializar variáveis de sessão se não existirem
-    if 'status_bot' not in st.session_state:
-        st.session_state.status_bot = "Parado"
-    if 'logs' not in st.session_state:
-        st.session_state.logs = []
-    if 'saldo' not in st.session_state:
-        st.session_state.saldo = 0.0
+        st.session_state.bot_ativo = True
         
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Status", st.session_state.status_bot)
-    col2.metric("Saldo Atual", f"R$ {st.session_state.saldo:.2f}")
-    
-    # Botão de Iniciar/Parar (Simulado para esta demo)
-    if st.button("▶️ Iniciar Bot", use_container_width=True):
-        st.session_state.status_bot = "Rodando..."
-        st.info("Bot iniciado! Aguardando sinais no canal...")
-        # Aqui você chamaria a função assíncrona do bot real
-    
-    if st.button("🛑 Parar Bot", use_container_width=True):
-        st.session_state.status_bot = "Parado"
+        # Inicia a Thread do Bot
+        t = threading.Thread(target=iniciar_bot_aluno, args=(st.session_state.dados,))
+        t.daemon = True
+        t.start()
+        st.rerun()
 
-with tab3:
-    st.header("Logs em Tempo Real")
-    # Área para mostrar os logs que apareceriam no terminal
-    for log in st.session_state.logs[-10:]:
-        st.text(log)
+# Painel de Status
+if st.session_state.bot_ativo:
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Status do Bot", st.session_state.dados['status'])
+        st.metric("Saldo Atual", f"R$ {st.session_state.dados['saldo']:.2f}")
+    with col2:
+        st.info(f"Último Evento: {st.session_state.dados['ultimo_sinal']}")
+    
+    if st.button("🛑 Parar Operação"):
+        st.session_state.bot_ativo = False
+        st.session_state.dados['status'] = "Parado pelo usuário"
+        st.rerun()
+else:
+    st.warning("⚠️ Preencha seus dados acima para começar a operar.")
 
-# Nota: Para rodar o bot real em background, você precisaria de threading ou asyncio loop
-# Isso é uma estrutura base de interface.
+st.caption("Canal de Sinais: Quantum VIP (Admin) | Execução: Conta do Aluno")
